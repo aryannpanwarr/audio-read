@@ -1,0 +1,249 @@
+:root {
+  --accent: #4f46e5;
+  --accent-soft: #eef2ff;
+  --text: #1f2430;
+  --text-dim: #6b7280;
+  --bg: #fafaf8;
+  --border: #e5e7eb;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* ---------- upload screen ---------- */
+
+.upload-screen {
+  max-width: 540px;
+  margin: 14vh auto 0;
+  padding: 0 1.5rem;
+  text-align: center;
+}
+
+.upload-screen h1 {
+  font-size: 2.2rem;
+  margin-bottom: 0.25rem;
+}
+
+.tagline {
+  color: var(--text-dim);
+  margin-bottom: 2rem;
+}
+
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 16px;
+  padding: 4rem 2rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  font-size: 1.05rem;
+  color: var(--text-dim);
+}
+
+.dropzone strong {
+  color: var(--text);
+}
+
+.dropzone:hover,
+.dropzone.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.error {
+  color: #b91c1c;
+  margin-top: 1rem;
+}
+
+.error.banner {
+  text-align: center;
+  margin: 0.5rem auto;
+  max-width: 70ch;
+}
+
+/* ---------- reader layout ---------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1.25rem;
+  background: rgba(250, 250, 248, 0.92);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 700;
+}
+
+.device-badge {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+}
+
+.reset-btn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.reset-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------- model loading ---------- */
+
+.model-loading {
+  padding: 0.5rem 1.25rem;
+  background: var(--accent-soft);
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.model-loading-track {
+  margin-top: 0.35rem;
+  height: 4px;
+  border-radius: 2px;
+  background: #dbe0ff;
+  overflow: hidden;
+}
+
+.model-loading-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.2s;
+}
+
+/* ---------- document text ---------- */
+
+.reader {
+  flex: 1;
+  max-width: 70ch;
+  width: 100%;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 7rem;
+  font-size: 1.15rem;
+  line-height: 1.85;
+  white-space: pre-wrap;
+}
+
+.word {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0 1px;
+}
+
+.word:hover {
+  background: var(--accent-soft);
+}
+
+.word-hl {
+  background: var(--accent);
+  color: #fff;
+}
+
+.sentence-cur {
+  background: rgba(79, 70, 229, 0.07);
+  border-radius: 4px;
+}
+
+/* ---------- bottom control bar ---------- */
+
+.controls {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1.25rem;
+  padding: 0.75rem 1.25rem;
+  background: #fff;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.play-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1.3rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.1s, opacity 0.15s;
+}
+
+.play-btn:hover:not(:disabled) {
+  transform: scale(1.06);
+}
+
+.play-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.control-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.control-field select {
+  font-size: 0.95rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.time-display {
+  font-size: 0.9rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.time-display strong {
+  color: var(--text);
+}
