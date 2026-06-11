@@ -5,10 +5,12 @@ import { segmentParagraphs, sentenceWeight, wordIndexAtFraction } from '../lib/s
 import { TimeEstimator } from '../lib/estimate'
 import { TtsClient, CancelledError, type ProgressInfo } from '../tts/ttsClient'
 import { DEFAULT_VOICE } from '../tts/voices'
+import { cancelSpeech, hasDeviceTts, loadDeviceVoices, speak } from '../tts/deviceTts'
 import { Player } from '../audio/player'
 
 export type Phase = 'idle' | 'extracting' | 'ready' | 'playing' | 'paused' | 'buffering'
 export type ModelStatus = 'idle' | 'loading' | 'ready'
+export type Engine = 'kokoro' | 'device'
 
 export interface Highlight {
   s: number
@@ -18,6 +20,16 @@ export interface Highlight {
 const PREFETCH_AHEAD = 2
 const CACHE_LIMIT = 24
 
+function initialEngine(): Engine {
+  const saved = localStorage.getItem('audio-read-engine')
+  if (saved === 'kokoro' || saved === 'device') {
+    return saved === 'device' && !hasDeviceTts() ? 'kokoro' : saved
+  }
+  // phones: native OS voices are instant and need no 90MB download
+  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  return mobile && hasDeviceTts() ? 'device' : 'kokoro'
+}
+
 export function useReader() {
   const [phase, setPhaseState] = useState<Phase>('idle')
   const [sentences, setSentences] = useState<Sentence[]>([])
@@ -25,6 +37,9 @@ export function useReader() {
   const [highlight, setHighlight] = useState<Highlight | null>(null)
   const [voice, setVoiceState] = useState(DEFAULT_VOICE)
   const [speed, setSpeedState] = useState(1)
+  const [engine, setEngineState] = useState<Engine>(initialEngine)
+  const [deviceVoices, setDeviceVoices] = useState<SpeechSynthesisVoice[]>([])
+  const [deviceVoiceUri, setDeviceVoiceUriState] = useState<string>('')
   const [modelStatus, setModelStatusState] = useState<ModelStatus>('idle')
   const [modelProgress, setModelProgress] = useState({ loaded: 0, total: 0 })
   const [device, setDevice] = useState<string | null>(null)
@@ -37,6 +52,10 @@ export function useReader() {
   const currentRef = useRef(0)
   const voiceRef = useRef(DEFAULT_VOICE)
   const speedRef = useRef(1)
+  const engineRef = useRef<Engine>(engine)
+  const deviceVoicesRef = useRef<SpeechSynthesisVoice[]>([])
+  const deviceVoiceUriRef = useRef('')
+  const deviceTokenRef = useRef(0) // invalidates stale utterance callbacks
   const modelStatusRef = useRef<ModelStatus>('idle')
   const epochRef = useRef(0)
   const waitingForRef = useRef<number | null>(null)
@@ -62,6 +81,8 @@ export function useReader() {
     currentRef.current = i
     setCurrent(i)
   }
+
+  // ---------- kokoro engine ----------
 
   const synthesizeSentence = async (i: number, epoch: number) => {
     const sents = sentencesRef.current
@@ -116,6 +137,54 @@ export function useReader() {
     }
   }
 
+  // ---------- device (Web Speech) engine ----------
+
+  const startDeviceSentence = (i: number) => {
+    const sents = sentencesRef.current
+    if (i >= sents.length) {
+      setPhase('ready')
+      setHighlight(null)
+      setCurrentSentence(0)
+      return
+    }
+    const s = sents[i]
+    setCurrentSentence(i)
+    setHighlight({ s: i, w: 0 })
+    setPhase('playing')
+    const token = ++deviceTokenRef.current
+    const voiceObj =
+      deviceVoicesRef.current.find((v) => v.voiceURI === deviceVoiceUriRef.current) ?? null
+    const t0 = performance.now()
+    speak(s.text, voiceObj, speedRef.current, {
+      onBoundary: (charIndex) => {
+        if (token !== deviceTokenRef.current) return
+        let w = 0
+        for (let k = 0; k < s.words.length; k++) {
+          if (s.words[k].start <= charIndex) w = k
+          else break
+        }
+        setHighlight((prev) => (prev && prev.s === i && prev.w === w ? prev : { s: i, w }))
+      },
+      onEnd: () => {
+        if (token !== deviceTokenRef.current) return
+        estimatorRef.current.observe(sentenceWeight(s), (performance.now() - t0) / 1000, speedRef.current)
+        startDeviceSentence(i + 1)
+      },
+      onError: (err) => {
+        if (token !== deviceTokenRef.current) return
+        console.error(`Device speech failed for sentence ${i}:`, err)
+        startDeviceSentence(i + 1)
+      },
+    })
+  }
+
+  const stopDevice = () => {
+    deviceTokenRef.current++
+    cancelSpeech()
+  }
+
+  // ---------- shared playback control ----------
+
   const startSentence = (i: number) => {
     const sents = sentencesRef.current
     while (i < sents.length && failedRef.current.has(i)) i++
@@ -140,7 +209,13 @@ export function useReader() {
   }
 
   const play = () => {
-    if (modelStatusRef.current !== 'ready' || sentencesRef.current.length === 0) return
+    if (sentencesRef.current.length === 0) return
+    if (engineRef.current === 'device') {
+      // pause is cancel-based, so resume restarts the current sentence
+      startDeviceSentence(currentRef.current)
+      return
+    }
+    if (modelStatusRef.current !== 'ready') return
     playerRef.current.unlock()
     if (phaseRef.current === 'paused' && playerRef.current.hasSource) {
       playerRef.current.resume()
@@ -151,6 +226,12 @@ export function useReader() {
   }
 
   const pause = () => {
+    if (engineRef.current === 'device') {
+      if (phaseRef.current !== 'playing') return
+      stopDevice()
+      setPhase('paused')
+      return
+    }
     if (phaseRef.current === 'buffering') {
       waitingForRef.current = null
       setPhase('paused')
@@ -168,9 +249,20 @@ export function useReader() {
     pendingRef.current.clear()
   }
 
+  const stopAll = () => {
+    cancelInFlight()
+    playerRef.current.stop()
+    stopDevice()
+  }
+
   const jumpTo = (s: number) => {
     if (s < 0 || s >= sentencesRef.current.length) return
     failedRef.current.delete(s)
+    if (engineRef.current === 'device') {
+      stopDevice()
+      startDeviceSentence(s)
+      return
+    }
     if (modelStatusRef.current !== 'ready') {
       // model still downloading: just move the cursor so play starts here
       setCurrentSentence(s)
@@ -184,10 +276,16 @@ export function useReader() {
   }
 
   const flushAudio = () => {
+    const wasPlaying = phaseRef.current === 'playing' || phaseRef.current === 'buffering'
+    if (engineRef.current === 'device') {
+      stopDevice()
+      if (wasPlaying) startDeviceSentence(currentRef.current)
+      else if (phaseRef.current === 'paused') setPhase('ready')
+      return
+    }
     cancelInFlight()
     cacheRef.current.clear()
     failedRef.current.clear()
-    const wasPlaying = phaseRef.current === 'playing' || phaseRef.current === 'buffering'
     playerRef.current.stop()
     if (wasPlaying) {
       startSentence(currentRef.current)
@@ -211,7 +309,27 @@ export function useReader() {
     flushAudio()
   }
 
+  const setDeviceVoiceUri = (uri: string) => {
+    if (uri === deviceVoiceUriRef.current) return
+    deviceVoiceUriRef.current = uri
+    setDeviceVoiceUriState(uri)
+    flushAudio()
+  }
+
+  const setEngine = (e: Engine) => {
+    if (e === engineRef.current) return
+    stopAll()
+    engineRef.current = e
+    setEngineState(e)
+    localStorage.setItem('audio-read-engine', e)
+    if (phaseRef.current === 'playing' || phaseRef.current === 'buffering' || phaseRef.current === 'paused') {
+      setPhase('ready')
+    }
+    if (e === 'kokoro' && sentencesRef.current.length > 0) initModel()
+  }
+
   const initModel = () => {
+    if (engineRef.current !== 'kokoro') return
     if (modelStatusRef.current !== 'idle') return
     setModelStatus('loading')
     if (!ttsRef.current) ttsRef.current = new TtsClient()
@@ -244,8 +362,7 @@ export function useReader() {
       const paragraphs = await extractParagraphs(file)
       const segs = segmentParagraphs(paragraphs)
       if (segs.length === 0) throw new NoTextError()
-      cancelInFlight()
-      playerRef.current.stop()
+      stopAll()
       cacheRef.current.clear()
       failedRef.current.clear()
       sentencesRef.current = segs
@@ -264,8 +381,7 @@ export function useReader() {
   }
 
   const reset = () => {
-    cancelInFlight()
-    playerRef.current.stop()
+    stopAll()
     cacheRef.current.clear()
     failedRef.current.clear()
     sentencesRef.current = []
@@ -277,9 +393,24 @@ export function useReader() {
     setPhase('idle')
   }
 
-  // word highlighter: poll the audio clock, update state only when the word changes
+  // discover the OS/browser voices once
   useEffect(() => {
-    if (phase !== 'playing') return
+    void loadDeviceVoices().then((voices) => {
+      deviceVoicesRef.current = voices
+      setDeviceVoices(voices)
+      if (voices.length && !deviceVoiceUriRef.current) {
+        // prefer a local (offline) voice as the default
+        const preferred = voices.find((v) => v.localService) ?? voices[0]
+        deviceVoiceUriRef.current = preferred.voiceURI
+        setDeviceVoiceUriState(preferred.voiceURI)
+      }
+    })
+  }, [])
+
+  // word highlighter for the kokoro engine: poll the audio clock
+  // (the device engine gets real word boundaries from speechSynthesis instead)
+  useEffect(() => {
+    if (phase !== 'playing' || engine !== 'kokoro') return
     let raf = 0
     const tick = () => {
       const i = currentRef.current
@@ -293,7 +424,7 @@ export function useReader() {
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
-  }, [phase])
+  }, [phase, engine])
 
   // time estimates, refreshed twice a second
   useEffect(() => {
@@ -309,7 +440,7 @@ export function useReader() {
       const total = est.seconds(prefix[n], spd)
       const i = Math.min(currentRef.current, n - 1)
       let remaining = est.seconds(prefix[n] - prefix[i], spd)
-      if (phaseRef.current === 'playing' || phaseRef.current === 'paused') {
+      if (engineRef.current === 'kokoro' && (phaseRef.current === 'playing' || phaseRef.current === 'paused')) {
         remaining -= Math.min(playerRef.current.elapsed, est.seconds(prefix[i + 1] - prefix[i], spd))
       }
       setTimes((prev) => {
@@ -328,6 +459,9 @@ export function useReader() {
     highlight,
     voice,
     speed,
+    engine,
+    deviceVoices,
+    deviceVoiceUri,
     modelStatus,
     modelProgress,
     device,
@@ -339,6 +473,8 @@ export function useReader() {
     jumpTo,
     setSpeed,
     setVoice,
+    setEngine,
+    setDeviceVoiceUri,
     reset,
   }
 }

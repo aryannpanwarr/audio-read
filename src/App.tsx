@@ -22,13 +22,17 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <span className="brand">🔊 Audio Read</span>
-        {reader.device && <span className="device-badge">{reader.device}</span>}
+        {reader.engine === 'device' ? (
+          <span className="device-badge">device voices</span>
+        ) : (
+          reader.device && <span className="device-badge">{reader.device}</span>
+        )}
         <button className="reset-btn" onClick={reader.reset}>
           Open another PDF
         </button>
       </header>
 
-      {reader.modelStatus === 'loading' && (
+      {reader.engine === 'kokoro' && reader.modelStatus === 'loading' && (
         <ModelLoadingBar loaded={reader.modelProgress.loaded} total={reader.modelProgress.total} />
       )}
       {reader.error && <p className="error banner">{reader.error}</p>}
@@ -43,13 +47,18 @@ export default function App() {
 
       <Controls
         phase={reader.phase}
+        engine={reader.engine}
         modelStatus={reader.modelStatus}
         voice={reader.voice}
+        deviceVoices={reader.deviceVoices}
+        deviceVoiceUri={reader.deviceVoiceUri}
         speed={reader.speed}
         times={reader.times}
         onPlay={reader.play}
         onPause={reader.pause}
+        onEngine={reader.setEngine}
         onVoice={reader.setVoice}
+        onDeviceVoice={reader.setDeviceVoiceUri}
         onSpeed={reader.setSpeed}
       />
     </div>
