@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, type MouseEvent } from 'react'
+import { memo, useEffect, useMemo, useRef, type MouseEvent } from 'react'
 import type { Sentence } from '../types'
 import type { Highlight } from '../hooks/useReader'
 
@@ -71,16 +71,29 @@ export function ReaderView({ sentences, highlight, current, isPlaying, onWordCli
       ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }, [current, isPlaying])
 
+  const paragraphs = useMemo(() => {
+    const groups: { para: number; heading: boolean; sentences: Sentence[] }[] = []
+    for (const s of sentences) {
+      const last = groups[groups.length - 1]
+      if (last && last.para === s.para) last.sentences.push(s)
+      else groups.push({ para: s.para, heading: s.heading, sentences: [s] })
+    }
+    return groups
+  }, [sentences])
+
   return (
     <div className="reader" onClick={handleClick}>
-      {sentences.map((s) => (
-        <SentenceSpan
-          key={s.index}
-          sentence={s}
-          highlightWord={highlight && highlight.s === s.index ? highlight.w : null}
-          isCurrent={s.index === current}
-        />
-      ))}
+      {paragraphs.map((g) => {
+        const body = g.sentences.map((s) => (
+          <SentenceSpan
+            key={s.index}
+            sentence={s}
+            highlightWord={highlight && highlight.s === s.index ? highlight.w : null}
+            isCurrent={s.index === current}
+          />
+        ))
+        return g.heading ? <h3 key={g.para}>{body}</h3> : <p key={g.para}>{body}</p>
+      })}
     </div>
   )
 }

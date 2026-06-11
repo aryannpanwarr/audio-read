@@ -10,6 +10,10 @@ export interface Sentence {
   index: number
   text: string
   words: Word[]
+  /** which paragraph this sentence belongs to */
+  para: number
+  /** paragraph is a heading (larger font in the source PDF) */
+  heading: boolean
 }
 
 export type WorkerRequest =

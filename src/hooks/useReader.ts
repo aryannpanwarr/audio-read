@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Sentence } from '../types'
-import { extractText, NoTextError } from '../lib/pdf'
-import { segmentText, sentenceWeight, wordIndexAtFraction } from '../lib/segment'
+import { extractParagraphs, NoTextError } from '../lib/pdf'
+import { segmentParagraphs, sentenceWeight, wordIndexAtFraction } from '../lib/segment'
 import { TimeEstimator } from '../lib/estimate'
 import { TtsClient, CancelledError, type ProgressInfo } from '../tts/ttsClient'
 import { DEFAULT_VOICE } from '../tts/voices'
@@ -241,8 +241,8 @@ export function useReader() {
     setError(null)
     setPhase('extracting')
     try {
-      const text = await extractText(file)
-      const segs = segmentText(text)
+      const paragraphs = await extractParagraphs(file)
+      const segs = segmentParagraphs(paragraphs)
       if (segs.length === 0) throw new NoTextError()
       cancelInFlight()
       playerRef.current.stop()

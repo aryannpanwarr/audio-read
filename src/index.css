@@ -154,7 +154,21 @@ body {
   padding: 2rem 1.5rem 7rem;
   font-size: 1.15rem;
   line-height: 1.85;
-  white-space: pre-wrap;
+}
+
+.reader p {
+  margin: 0 0 1.1em;
+}
+
+.reader h3 {
+  margin: 1.8em 0 0.7em;
+  font-size: 1.3em;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.reader h3:first-child {
+  margin-top: 0;
 }
 
 .word {

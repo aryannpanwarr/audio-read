@@ -1,7 +1,10 @@
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import { buildLines, buildParagraphs, dropRunningHeaders, type Line, type Paragraph } from './pdfText'
 
 GlobalWorkerOptions.workerSrc = workerUrl
+
+export type { Paragraph }
 
 export class NoTextError extends Error {
   constructor() {
@@ -10,31 +13,23 @@ export class NoTextError extends Error {
   }
 }
 
-export async function extractText(file: File): Promise<string> {
+export async function extractParagraphs(file: File): Promise<Paragraph[]> {
   const data = await file.arrayBuffer()
   const loadingTask = getDocument({ data })
   const doc = await loadingTask.promise
   try {
-    const pages: string[] = []
+    const pages: Line[][] = []
     for (let i = 1; i <= doc.numPages; i++) {
       const page = await doc.getPage(i)
       const content = await page.getTextContent()
-      let t = ''
-      for (const item of content.items) {
-        if (!('str' in item)) continue
-        t += item.str
-        if (item.hasEOL) {
-          // de-hyphenate words broken across lines, otherwise treat EOL as a space
-          t = t.endsWith('-') ? t.slice(0, -1) : t + ' '
-        }
-      }
-      pages.push(t.replace(/\s+/g, ' ').trim())
+      pages.push(buildLines(content.items.filter((it) => 'str' in it)))
       page.cleanup()
     }
-    const text = pages.filter(Boolean).join('\n\n')
-    const chars = text.replace(/\s/g, '').length
+    dropRunningHeaders(pages)
+    const paragraphs = buildParagraphs(pages)
+    const chars = paragraphs.map((p) => p.text).join('').replace(/\s/g, '').length
     if (chars < 50 || chars / doc.numPages < 25) throw new NoTextError()
-    return text
+    return paragraphs
   } finally {
     void loadingTask.destroy()
   }

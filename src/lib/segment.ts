@@ -1,24 +1,33 @@
 import type { Sentence, Word } from '../types'
+import type { Paragraph } from './pdfText'
 
 /** Kokoro truncates past ~510 phonemes, so cap sentence length well below that. */
 const MAX_CHARS = 400
 
-export function segmentText(text: string): Sentence[] {
+export function segmentParagraphs(paragraphs: Paragraph[]): Sentence[] {
   const sentenceSeg = new Intl.Segmenter('en', { granularity: 'sentence' })
   const wordSeg = new Intl.Segmenter('en', { granularity: 'word' })
   const sentences: Sentence[] = []
-  for (const seg of sentenceSeg.segment(text)) {
-    for (const chunk of splitLong(seg.segment)) {
-      const words: Word[] = []
-      for (const w of wordSeg.segment(chunk)) {
-        if (w.isWordLike) {
-          words.push({ text: w.segment, start: w.index, end: w.index + w.segment.length })
+  paragraphs.forEach((para, pi) => {
+    for (const seg of sentenceSeg.segment(para.text)) {
+      for (const chunk of splitLong(seg.segment)) {
+        const words: Word[] = []
+        for (const w of wordSeg.segment(chunk)) {
+          if (w.isWordLike) {
+            words.push({ text: w.segment, start: w.index, end: w.index + w.segment.length })
+          }
         }
+        if (words.length === 0) continue
+        sentences.push({
+          index: sentences.length,
+          text: chunk,
+          words,
+          para: pi,
+          heading: para.heading,
+        })
       }
-      if (words.length === 0) continue
-      sentences.push({ index: sentences.length, text: chunk, words })
     }
-  }
+  })
   return sentences
 }
 
