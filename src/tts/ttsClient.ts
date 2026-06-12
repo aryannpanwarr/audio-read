@@ -71,9 +71,15 @@ export class TtsClient {
               ]
             : [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
           : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
-      // testing hook: ?dtype=fp16 etc. tries that variant first
-      const dtypeOverride = new URLSearchParams(location.search).get('dtype')
+      // testing hooks: ?dtype=fp16 etc. tries that variant first;
+      // ?threads=8 overrides the WASM thread count (default caps at 4)
+      const params = new URLSearchParams(location.search)
+      const dtypeOverride = params.get('dtype')
       if (dtypeOverride) attempts.unshift({ device, dtype: dtypeOverride })
+      const threadsOverride = Number(params.get('threads'))
+      if (threadsOverride > 0) {
+        for (const a of attempts) if (a.device === 'wasm') a.threads = threadsOverride
+      }
       let lastError: unknown
       for (const attempt of attempts) {
         try {

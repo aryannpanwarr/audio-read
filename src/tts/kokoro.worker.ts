@@ -58,7 +58,10 @@ async function init(device: 'webgpu' | 'wasm', threads?: number, dtype?: string)
   const model = await load(device, dtype)
   await verifyOutput(model)
   tts = model
-  post({ type: 'ready', device: threads === 1 ? `${device} (1 thread)` : device })
+  post({
+    type: 'ready',
+    device: threads ? `${device} (${threads} ${threads === 1 ? 'thread' : 'threads'})` : device,
+  })
   pump()
 }
 
