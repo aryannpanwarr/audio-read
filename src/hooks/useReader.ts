@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Sentence } from '../types'
 import { extractParagraphs, NoTextError } from '../lib/pdf'
-import { segmentParagraphs, sentenceWeight, wordIndexAtFraction } from '../lib/segment'
+import { chunkBoundaries, rangeWeight, segmentParagraphs, sentenceWeight, wordIndexInRange } from '../lib/segment'
+import { docKey, loadPosition, loadPrefs, savePosition, savePrefs } from '../lib/persist'
 import { TimeEstimator } from '../lib/estimate'
 import { TtsClient, CancelledError, type ProgressInfo } from '../tts/ttsClient'
 import { DEFAULT_VOICE } from '../tts/voices'
@@ -20,6 +21,18 @@ export interface Highlight {
 const PREFETCH_AHEAD = 2
 const CACHE_LIMIT = 24
 
+interface AudioChunk {
+  buf: AudioBuffer
+  /** word range [fromWord, toWord) of the sentence this chunk speaks */
+  fromWord: number
+  toWord: number
+}
+
+interface SentenceAudio {
+  chunks: AudioChunk[]
+  complete: boolean
+}
+
 function initialEngine(): Engine {
   const saved = localStorage.getItem('audio-read-engine')
   if (saved === 'kokoro' || saved === 'device') {
@@ -35,8 +48,8 @@ export function useReader() {
   const [sentences, setSentences] = useState<Sentence[]>([])
   const [current, setCurrent] = useState(0)
   const [highlight, setHighlight] = useState<Highlight | null>(null)
-  const [voice, setVoiceState] = useState(DEFAULT_VOICE)
-  const [speed, setSpeedState] = useState(1)
+  const [voice, setVoiceState] = useState(() => loadPrefs().voice ?? DEFAULT_VOICE)
+  const [speed, setSpeedState] = useState(() => loadPrefs().speed ?? 1)
   const [engine, setEngineState] = useState<Engine>(initialEngine)
   const [deviceVoices, setDeviceVoices] = useState<SpeechSynthesisVoice[]>([])
   const [deviceVoiceUri, setDeviceVoiceUriState] = useState<string>('')
@@ -50,16 +63,18 @@ export function useReader() {
   const sentencesRef = useRef<Sentence[]>([])
   const prefixRef = useRef<number[]>([0]) // prefix[i] = total weight of sentences 0..i-1
   const currentRef = useRef(0)
-  const voiceRef = useRef(DEFAULT_VOICE)
-  const speedRef = useRef(1)
+  const docKeyRef = useRef<string | null>(null)
+  const voiceRef = useRef(voice)
+  const speedRef = useRef(speed)
   const engineRef = useRef<Engine>(engine)
   const deviceVoicesRef = useRef<SpeechSynthesisVoice[]>([])
   const deviceVoiceUriRef = useRef('')
   const deviceTokenRef = useRef(0) // invalidates stale utterance callbacks
   const modelStatusRef = useRef<ModelStatus>('idle')
   const epochRef = useRef(0)
-  const waitingForRef = useRef<number | null>(null)
-  const cacheRef = useRef(new Map<number, AudioBuffer>())
+  const waitingForRef = useRef<{ s: number; chunk: number } | null>(null)
+  const playingChunkRef = useRef<{ s: number; chunk: number } | null>(null)
+  const cacheRef = useRef(new Map<number, SentenceAudio>())
   const pendingRef = useRef(new Set<number>())
   const failedRef = useRef(new Set<number>())
   const ttsRef = useRef<TtsClient | null>(null)
@@ -80,36 +95,63 @@ export function useReader() {
   const setCurrentSentence = (i: number) => {
     currentRef.current = i
     setCurrent(i)
+    if (docKeyRef.current && sentencesRef.current.length > 0) {
+      savePosition(docKeyRef.current, i)
+    }
   }
 
   // ---------- kokoro engine ----------
 
+  /**
+   * Synthesize sentence i in clause-sized pieces. The first piece is small,
+   * so audio can start (sub-)seconds after a cold start; all pieces are
+   * posted to the worker queue up front, so prefetch for later sentences
+   * can never delay this sentence's remainder.
+   */
   const synthesizeSentence = async (i: number, epoch: number) => {
     const sents = sentencesRef.current
     const cache = cacheRef.current
-    if (i >= sents.length || cache.has(i) || pendingRef.current.has(i) || failedRef.current.has(i)) return
+    if (i >= sents.length || cache.get(i)?.complete || pendingRef.current.has(i) || failedRef.current.has(i)) return
     if (!ttsRef.current || modelStatusRef.current !== 'ready') return
+    const s = sents[i]
+    const n = s.words.length
     pendingRef.current.add(i)
     try {
-      const { samples, sampleRate } = await ttsRef.current.synthesize(
-        sents[i].text,
-        voiceRef.current,
-        speedRef.current,
+      const bounds = chunkBoundaries(s)
+      const pieces = bounds.map((from, idx) => {
+        const to = idx + 1 < bounds.length ? bounds[idx + 1] : n
+        const endChar = to < n ? s.words[to].start : s.text.length
+        return { text: s.text.slice(s.words[from].start, endChar).trim(), from, to }
+      })
+      // enqueue everything now — the worker is serial, results come in order
+      const requests = pieces.map((p) =>
+        ttsRef.current!.synthesize(p.text, voiceRef.current, speedRef.current),
       )
-      if (epoch !== epochRef.current) return
-      const buf = playerRef.current.makeBuffer(samples, sampleRate)
-      cache.set(i, buf)
-      estimatorRef.current.observe(sentenceWeight(sents[i]), buf.duration, speedRef.current)
-      evictCache()
-      if (waitingForRef.current === i) {
-        waitingForRef.current = null
-        startSentence(i)
+      for (const r of requests) r.catch(() => {}) // late cancellations are expected
+
+      const entry: SentenceAudio = { chunks: [], complete: false }
+      for (let idx = 0; idx < pieces.length; idx++) {
+        const { samples, sampleRate } = await requests[idx]
+        if (epoch !== epochRef.current) return
+        const piece = pieces[idx]
+        const buf = playerRef.current.makeBuffer(samples, sampleRate)
+        estimatorRef.current.observe(rangeWeight(s, piece.from, piece.to), buf.duration, speedRef.current)
+        entry.chunks.push({ buf, fromWord: piece.from, toWord: piece.to })
+        entry.complete = piece.to === n
+        cache.set(i, entry) // re-set in case eviction raced us
+        const waiting = waitingForRef.current
+        if (waiting && waiting.s === i && waiting.chunk < entry.chunks.length) {
+          waitingForRef.current = null
+          playChunk(i, waiting.chunk)
+        }
       }
+      evictCache()
     } catch (e) {
       if (e instanceof CancelledError || epoch !== epochRef.current) return
       console.error(`Synthesis failed for sentence ${i}:`, e)
+      cache.delete(i) // drop any partial head
       failedRef.current.add(i)
-      if (waitingForRef.current === i) {
+      if (waitingForRef.current?.s === i) {
         waitingForRef.current = null
         startSentence(i + 1)
       }
@@ -135,6 +177,30 @@ export function useReader() {
     for (let i = from; i < Math.min(from + PREFETCH_AHEAD + 1, sentencesRef.current.length); i++) {
       void synthesizeSentence(i, epoch)
     }
+  }
+
+  /** Play chunk c of sentence i, chaining into the next chunk/sentence. */
+  const playChunk = (i: number, c: number) => {
+    const entry = cacheRef.current.get(i)
+    const chunk = entry?.chunks[c]
+    if (!chunk) {
+      setPhase('buffering')
+      waitingForRef.current = { s: i, chunk: c }
+      return
+    }
+    playingChunkRef.current = { s: i, chunk: c }
+    setPhase('playing')
+    playerRef.current.play(chunk.buf, () => {
+      const e = cacheRef.current.get(i)
+      if (e && c + 1 < e.chunks.length) {
+        playChunk(i, c + 1)
+      } else if (e && !e.complete) {
+        setPhase('buffering')
+        waitingForRef.current = { s: i, chunk: c + 1 }
+      } else {
+        startSentence(i + 1)
+      }
+    })
   }
 
   // ---------- device (Web Speech) engine ----------
@@ -197,15 +263,16 @@ export function useReader() {
     }
     setCurrentSentence(i)
     setHighlight({ s: i, w: 0 })
-    prefetchFrom(i)
-    const buf = cacheRef.current.get(i)
-    if (!buf) {
+    if (!cacheRef.current.get(i)) {
+      // cold start: this sentence's pieces enter the queue before prefetch
       setPhase('buffering')
-      waitingForRef.current = i
+      waitingForRef.current = { s: i, chunk: 0 }
+      void synthesizeSentence(i, epochRef.current)
+      prefetchFrom(i + 1)
       return
     }
-    setPhase('playing')
-    playerRef.current.play(buf, () => startSentence(i + 1))
+    prefetchFrom(i + 1)
+    playChunk(i, 0)
   }
 
   const play = () => {
@@ -251,6 +318,7 @@ export function useReader() {
 
   const stopAll = () => {
     cancelInFlight()
+    playingChunkRef.current = null
     playerRef.current.stop()
     stopDevice()
   }
@@ -284,6 +352,7 @@ export function useReader() {
       return
     }
     cancelInFlight()
+    playingChunkRef.current = null
     cacheRef.current.clear()
     failedRef.current.clear()
     playerRef.current.stop()
@@ -299,6 +368,7 @@ export function useReader() {
     if (v === speedRef.current) return
     speedRef.current = v
     setSpeedState(v)
+    savePrefs({ speed: v })
     flushAudio()
   }
 
@@ -306,6 +376,7 @@ export function useReader() {
     if (v === voiceRef.current) return
     voiceRef.current = v
     setVoiceState(v)
+    savePrefs({ voice: v })
     flushAudio()
   }
 
@@ -313,6 +384,7 @@ export function useReader() {
     if (uri === deviceVoiceUriRef.current) return
     deviceVoiceUriRef.current = uri
     setDeviceVoiceUriState(uri)
+    savePrefs({ deviceVoice: uri })
     flushAudio()
   }
 
@@ -368,7 +440,7 @@ export function useReader() {
     setError(null)
     setPhase('extracting')
     try {
-      const paragraphs = await extractParagraphs(file)
+      const [paragraphs, key] = await Promise.all([extractParagraphs(file), docKey(file)])
       const segs = segmentParagraphs(paragraphs)
       if (segs.length === 0) throw new NoTextError()
       stopAll()
@@ -379,8 +451,12 @@ export function useReader() {
       for (const s of segs) prefix.push(prefix[prefix.length - 1] + sentenceWeight(s))
       prefixRef.current = prefix
       setSentences(segs)
-      setCurrentSentence(0)
-      setHighlight(null)
+      docKeyRef.current = key
+      // resume where this document was left off
+      const saved = loadPosition(key)
+      const startAt = saved != null && saved > 0 && saved < segs.length ? saved : 0
+      setCurrentSentence(startAt)
+      setHighlight(startAt > 0 ? { s: startAt, w: 0 } : null)
       setPhase('ready')
       initModel()
     } catch (e) {
@@ -391,6 +467,7 @@ export function useReader() {
 
   const reset = () => {
     stopAll()
+    docKeyRef.current = null
     cacheRef.current.clear()
     failedRef.current.clear()
     sentencesRef.current = []
@@ -408,8 +485,12 @@ export function useReader() {
       deviceVoicesRef.current = voices
       setDeviceVoices(voices)
       if (voices.length && !deviceVoiceUriRef.current) {
-        // prefer a local (offline) voice as the default
-        const preferred = voices.find((v) => v.localService) ?? voices[0]
+        // saved preference if still installed, else a local (offline) voice
+        const savedUri = loadPrefs().deviceVoice
+        const preferred =
+          voices.find((v) => v.voiceURI === savedUri) ??
+          voices.find((v) => v.localService) ??
+          voices[0]
         deviceVoiceUriRef.current = preferred.voiceURI
         setDeviceVoiceUriState(preferred.voiceURI)
       }
@@ -422,12 +503,15 @@ export function useReader() {
     if (phase !== 'playing' || engine !== 'kokoro') return
     let raf = 0
     const tick = () => {
-      const i = currentRef.current
-      const s = sentencesRef.current[i]
+      const pc = playingChunkRef.current
       const player = playerRef.current
-      if (s && player.currentDuration > 0) {
-        const w = wordIndexAtFraction(s, player.elapsed / player.currentDuration)
-        setHighlight((prev) => (prev && prev.s === i && prev.w === w ? prev : { s: i, w }))
+      if (pc && player.currentDuration > 0) {
+        const s = sentencesRef.current[pc.s]
+        const chunk = cacheRef.current.get(pc.s)?.chunks[pc.chunk]
+        if (s && chunk) {
+          const w = wordIndexInRange(s, chunk.fromWord, chunk.toWord, player.elapsed / player.currentDuration)
+          setHighlight((prev) => (prev && prev.s === pc.s && prev.w === w ? prev : { s: pc.s, w }))
+        }
       }
       raf = requestAnimationFrame(tick)
     }

@@ -1,8 +1,9 @@
 import type { Sentence, Word } from '../types'
 import type { Paragraph } from './pdfText'
 
-/** Kokoro truncates past ~510 phonemes, so cap sentence length well below that. */
-const MAX_CHARS = 400
+/** Kokoro truncates past ~510 phonemes; shorter chunks also mean less
+ * in-flight synthesis blocking the queue when the user jumps around. */
+const MAX_CHARS = 300
 
 export function segmentParagraphs(paragraphs: Paragraph[]): Sentence[] {
   const sentenceSeg = new Intl.Segmenter('en', { granularity: 'sentence' })
@@ -75,4 +76,50 @@ export function wordIndexAtFraction(s: Sentence, fraction: number): number {
   let k = 0
   while (k < s.words.length - 1 && cum[k + 1] <= target) k++
   return k
+}
+
+/** Total weight of words [from, to). */
+export function rangeWeight(s: Sentence, from: number, to: number): number {
+  const cum = cumWeights(s)
+  return cum[to] - cum[from]
+}
+
+/** Which word in [from, to) is being spoken at `fraction` of that range's audio. */
+export function wordIndexInRange(s: Sentence, from: number, to: number, fraction: number): number {
+  const cum = cumWeights(s)
+  const target = cum[from] + fraction * (cum[to] - cum[from])
+  let k = from
+  while (k < to - 1 && cum[k + 1] <= target) k++
+  return k
+}
+
+/**
+ * Word indices where each synthesis chunk of a sentence starts (always
+ * includes 0). The opening chunk is kept small (~90 chars) so audio starts
+ * fast; later chunks are larger (~200) to preserve prosody. Splits prefer
+ * clause boundaries. Capping chunk size also bounds how long any single
+ * (unabortable) inference can block the synthesis queue.
+ */
+export function chunkBoundaries(s: Sentence): number[] {
+  const n = s.words.length
+  const bounds = [0]
+  if (s.text.length <= 150 || n < 8) return bounds
+  let target = 90
+  let startChar = 0
+  let lastClause = -1
+  for (let i = 0; i < n - 1; i++) {
+    const end = s.words[i].end
+    const between = s.text.slice(end, s.words[i + 1].start)
+    if (/[,;:]/.test(between)) lastClause = i + 1
+    if (end - startChar >= target) {
+      const startWord = bounds[bounds.length - 1]
+      const cut = lastClause > startWord ? lastClause : i + 1
+      if (cut >= n || s.text.length - s.words[cut].start < 40) break // tail too small to split off
+      bounds.push(cut)
+      startChar = s.words[cut].start
+      lastClause = -1
+      target = 200
+    }
+  }
+  return bounds
 }

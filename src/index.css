@@ -185,6 +185,15 @@ body {
   margin-top: 0;
 }
 
+.sentence {
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.sentence:hover {
+  background: var(--accent-soft);
+}
+
 .word {
   cursor: pointer;
   border-radius: 4px;

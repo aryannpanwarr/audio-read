@@ -1,8 +1,4 @@
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
-import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { buildLines, buildParagraphs, dropRunningHeaders, type Line, type Paragraph } from './pdfText'
-
-GlobalWorkerOptions.workerSrc = workerUrl
 
 export type { Paragraph }
 
@@ -13,17 +9,32 @@ export class NoTextError extends Error {
   }
 }
 
+const PAGE_BATCH = 16
+
 export async function extractParagraphs(file: File): Promise<Paragraph[]> {
+  // pdf.js is ~400KB — load it only when a file actually arrives
+  const [{ getDocument, GlobalWorkerOptions }, worker] = await Promise.all([
+    import('pdfjs-dist'),
+    import('pdfjs-dist/build/pdf.worker.min.mjs?url'),
+  ])
+  GlobalWorkerOptions.workerSrc = worker.default
+
   const data = await file.arrayBuffer()
   const loadingTask = getDocument({ data })
   const doc = await loadingTask.promise
   try {
-    const pages: Line[][] = []
-    for (let i = 1; i <= doc.numPages; i++) {
-      const page = await doc.getPage(i)
-      const content = await page.getTextContent()
-      pages.push(buildLines(content.items.filter((it) => 'str' in it)))
-      page.cleanup()
+    const pages: Line[][] = new Array<Line[]>(doc.numPages)
+    for (let start = 1; start <= doc.numPages; start += PAGE_BATCH) {
+      const end = Math.min(start + PAGE_BATCH - 1, doc.numPages)
+      await Promise.all(
+        Array.from({ length: end - start + 1 }, async (_, j) => {
+          const pageNo = start + j
+          const page = await doc.getPage(pageNo)
+          const content = await page.getTextContent()
+          pages[pageNo - 1] = buildLines(content.items.filter((it) => 'str' in it))
+          page.cleanup()
+        }),
+      )
     }
     dropRunningHeaders(pages)
     const paragraphs = buildParagraphs(pages)
