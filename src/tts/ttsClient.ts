@@ -60,14 +60,16 @@ export class TtsClient {
       const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
       const attempts: { device: 'webgpu' | 'wasm'; threads?: number; dtype?: string }[] =
         device === 'webgpu'
-          ? [
-              // phones: fp16 first — half the download and, critically, half
-              // the GPU memory (fp32 risks crashing mobile tabs)
-              ...(mobile ? [{ device: 'webgpu' as const, dtype: 'fp16' }] : []),
-              { device: 'webgpu' },
-              { device: 'wasm' },
-              { device: 'wasm', threads: 1 },
-            ]
+          ? mobile
+            ? [
+                // phones: fp16 (half the download and GPU memory), then
+                // straight to WASM — fp32 on a phone GPU tends to OOM and
+                // kill the whole tab, which no fallback can recover from
+                { device: 'webgpu', dtype: 'fp16' },
+                { device: 'wasm' },
+                { device: 'wasm', threads: 1 },
+              ]
+            : [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
           : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
       // testing hook: ?dtype=fp16 etc. tries that variant first
       const dtypeOverride = new URLSearchParams(location.search).get('dtype')

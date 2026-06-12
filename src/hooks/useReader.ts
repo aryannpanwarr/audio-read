@@ -483,6 +483,12 @@ export function useReader() {
       const startAt = saved != null && saved > 0 && saved < segs.length ? saved : 0
       setCurrentSentence(startAt)
       setHighlight(startAt > 0 ? { s: startAt, w: 0 } : null)
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: file.name.replace(/\.pdf$/i, ''),
+          artist: 'Audio Read',
+        })
+      }
       setPhase('ready')
       initModel()
     } catch (e) {
@@ -493,6 +499,7 @@ export function useReader() {
 
   const reset = () => {
     stopAll()
+    if ('mediaSession' in navigator) navigator.mediaSession.metadata = null
     docKeyRef.current = null
     cacheRef.current.clear()
     failedRef.current.clear()
@@ -522,6 +529,30 @@ export function useReader() {
       }
     })
   }, [])
+
+  // lock-screen / notification media controls. The handlers only touch refs,
+  // so registering the first render's closures once is safe.
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return
+    const ms = navigator.mediaSession
+    ms.setActionHandler('play', () => play())
+    ms.setActionHandler('pause', () => pause())
+    ms.setActionHandler('previoustrack', () => jumpTo(currentRef.current - 1))
+    ms.setActionHandler('nexttrack', () => jumpTo(currentRef.current + 1))
+    return () => {
+      for (const a of ['play', 'pause', 'previoustrack', 'nexttrack'] as MediaSessionAction[]) {
+        ms.setActionHandler(a, null)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // keep the OS's notion of playing/paused in sync with ours
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return
+    navigator.mediaSession.playbackState =
+      phase === 'playing' || phase === 'buffering' ? 'playing' : phase === 'paused' ? 'paused' : 'none'
+  }, [phase])
 
   // word highlighter for the kokoro engine: poll the audio clock
   // (the device engine gets real word boundaries from speechSynthesis instead)

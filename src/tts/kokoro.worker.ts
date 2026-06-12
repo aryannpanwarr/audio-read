@@ -34,13 +34,30 @@ function load(device: 'webgpu' | 'wasm', dtype?: string) {
   })
 }
 
+/**
+ * Some backend/dtype combos (fp16 on certain mobile GPUs) load without error
+ * but synthesize silence or NaNs. Generate a short test utterance and throw
+ * if the output is unusable, so the client's fallback ladder moves on.
+ */
+async function verifyOutput(model: KokoroTTS) {
+  const test = await model.generate('Hi.', { voice: 'af_heart' as keyof KokoroTTS['voices'] })
+  const samples = test.audio
+  let peak = 0
+  for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]))
+  if (samples.length === 0 || !Number.isFinite(peak) || peak < 1e-4) {
+    throw new Error('model loaded but produced silent or invalid audio')
+  }
+}
+
 async function init(device: 'webgpu' | 'wasm', threads?: number, dtype?: string) {
   // multithreaded WASM crashes on some browsers — the client can retry
   // with threads pinned to 1
   if (threads && hfEnv.backends.onnx.wasm) hfEnv.backends.onnx.wasm.numThreads = threads
   // no in-worker fallback: a failed WebGPU init leaves onnxruntime in a broken
   // state, so the client recreates the whole worker and retries with WASM
-  tts = await load(device, dtype)
+  const model = await load(device, dtype)
+  await verifyOutput(model)
+  tts = model
   post({ type: 'ready', device: threads === 1 ? `${device} (1 thread)` : device })
   pump()
 }
