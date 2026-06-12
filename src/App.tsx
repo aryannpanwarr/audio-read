@@ -80,6 +80,7 @@ export default function App() {
         deviceVoices={reader.deviceVoices}
         deviceVoiceUri={reader.deviceVoiceUri}
         speed={reader.speed}
+        perf={reader.perf}
         times={reader.times}
         onPlay={reader.play}
         onPause={reader.pause}
@@ -87,6 +88,7 @@ export default function App() {
         onVoice={reader.setVoice}
         onDeviceVoice={reader.setDeviceVoiceUri}
         onSpeed={reader.setSpeed}
+        onPerf={reader.setPerf}
       />
     </div>
   )

@@ -23,6 +23,37 @@ interface Pending {
   reject: (e: Error) => void
 }
 
+/** User-selectable performance presets for the Kokoro engine. */
+export type Perf = 'auto' | 'cores' | 'lite' | 'lite-cores'
+
+export const PERF_OPTIONS: { id: Perf; label: string }[] = [
+  { id: 'auto', label: 'Default' },
+  { id: 'cores', label: 'All CPU cores' },
+  { id: 'lite', label: 'Lite model' },
+  { id: 'lite-cores', label: 'Lite + all cores' },
+]
+
+export interface InitOpts {
+  /** model variant to try first (always on WASM — quantized dtypes are unreliable on WebGPU) */
+  dtype?: string
+  /** WASM thread count (the runtime's default caps at 4) */
+  threads?: number
+}
+
+export function perfToOpts(perf: Perf): InitOpts {
+  const threads = navigator.hardwareConcurrency || 4
+  switch (perf) {
+    case 'cores':
+      return { threads }
+    case 'lite':
+      return { dtype: 'q4' }
+    case 'lite-cores':
+      return { dtype: 'q4', threads }
+    default:
+      return {}
+  }
+}
+
 export async function pickDevice(): Promise<'webgpu' | 'wasm'> {
   if (new URLSearchParams(location.search).get('device') === 'wasm') return 'wasm'
   const gpu = (navigator as Navigator & { gpu?: { requestAdapter(): Promise<unknown> } }).gpu
@@ -50,7 +81,7 @@ export class TtsClient {
   }
 
   /** Loads the model (idempotent). Resolves with the device actually used. */
-  init(onProgress: (p: ProgressInfo) => void): Promise<string> {
+  init(onProgress: (p: ProgressInfo) => void, opts: InitOpts = {}): Promise<string> {
     if (this.initPromise) return this.initPromise
     this.initPromise = (async () => {
       const device = await pickDevice()
@@ -71,6 +102,13 @@ export class TtsClient {
               ]
             : [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
           : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
+      // performance preset: a lite-model attempt goes in front of the ladder,
+      // a thread count applies to WASM attempts that don't pin their own
+      // (the threads:1 crash-retry keeps its 1)
+      if (opts.dtype) attempts.unshift({ device: 'wasm', dtype: opts.dtype })
+      if (opts.threads) {
+        for (const a of attempts) if (a.device === 'wasm' && a.threads == null) a.threads = opts.threads
+      }
       // testing hooks: ?dtype=fp16 etc. tries that variant first;
       // ?threads=8 overrides the WASM thread count (default caps at 4)
       const params = new URLSearchParams(location.search)

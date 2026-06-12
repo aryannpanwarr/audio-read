@@ -4,7 +4,7 @@ import { extractParagraphs, NoTextError } from '../lib/pdf'
 import { chunkBoundaries, rangeWeight, segmentParagraphs, sentenceWeight, wordIndexInRange } from '../lib/segment'
 import { docKey, loadPosition, loadPrefs, savePosition, savePrefs } from '../lib/persist'
 import { TimeEstimator } from '../lib/estimate'
-import { TtsClient, CancelledError, type ProgressInfo } from '../tts/ttsClient'
+import { TtsClient, CancelledError, perfToOpts, PERF_OPTIONS, type Perf, type ProgressInfo } from '../tts/ttsClient'
 import { DEFAULT_VOICE } from '../tts/voices'
 import { cancelSpeech, hasDeviceTts, loadDeviceVoices, speak } from '../tts/deviceTts'
 import { Player } from '../audio/player'
@@ -51,6 +51,10 @@ export function useReader() {
   const [highlight, setHighlight] = useState<Highlight | null>(null)
   const [voice, setVoiceState] = useState(() => loadPrefs().voice ?? DEFAULT_VOICE)
   const [speed, setSpeedState] = useState(() => loadPrefs().speed ?? 1)
+  const [perf, setPerfState] = useState<Perf>(() => {
+    const saved = loadPrefs().perf
+    return PERF_OPTIONS.some((o) => o.id === saved) ? (saved as Perf) : 'auto'
+  })
   const [engine, setEngineState] = useState<Engine>(initialEngine)
   const [deviceVoices, setDeviceVoices] = useState<SpeechSynthesisVoice[]>([])
   const [deviceVoiceUri, setDeviceVoiceUriState] = useState<string>('')
@@ -68,6 +72,7 @@ export function useReader() {
   const docKeyRef = useRef<string | null>(null)
   const voiceRef = useRef(voice)
   const speedRef = useRef(speed)
+  const perfRef = useRef<Perf>(perf)
   const engineRef = useRef<Engine>(engine)
   const deviceVoicesRef = useRef<SpeechSynthesisVoice[]>([])
   const deviceVoiceUriRef = useRef('')
@@ -400,6 +405,25 @@ export function useReader() {
     flushAudio()
   }
 
+  /** Change the performance preset: tear the model down and reload it. */
+  const setPerf = (p: Perf) => {
+    if (p === perfRef.current) return
+    perfRef.current = p
+    setPerfState(p)
+    savePrefs({ perf: p })
+    if (engineRef.current !== 'kokoro') return
+    stopAll()
+    playingChunkRef.current = null
+    cacheRef.current.clear()
+    failedRef.current.clear()
+    if (phaseRef.current !== 'idle' && phaseRef.current !== 'extracting') setPhase('ready')
+    ttsRef.current?.dispose()
+    ttsRef.current = null
+    setDevice(null)
+    setModelStatus('idle')
+    if (sentencesRef.current.length > 0) initModel()
+  }
+
   const setDeviceVoiceUri = (uri: string) => {
     if (uri === deviceVoiceUriRef.current) return
     deviceVoiceUriRef.current = uri
@@ -431,8 +455,12 @@ export function useReader() {
     progressFilesRef.current.clear()
     setModelProgress({ loaded: 0, total: 0 })
     if (!ttsRef.current) ttsRef.current = new TtsClient()
-    ttsRef.current
+    // a perf change mid-load swaps the client; the old one's callbacks
+    // must not touch state after that
+    const client = ttsRef.current
+    client
       .init((p) => {
+        if (ttsRef.current !== client) return
         progressFilesRef.current.set(p.file, p)
         let loaded = 0
         let total = 0
@@ -441,13 +469,15 @@ export function useReader() {
           total += f.total
         }
         setModelProgress({ loaded, total })
-      })
+      }, perfToOpts(perfRef.current))
       .then((dev) => {
+        if (ttsRef.current !== client) return
         setDevice(dev)
         setModelStatus('ready')
         prefetchFrom(currentRef.current)
       })
       .catch((e: Error) => {
+        if (ttsRef.current !== client) return
         // the worker is dead — throw the client away so Retry starts clean
         ttsRef.current?.dispose()
         ttsRef.current = null
@@ -609,6 +639,7 @@ export function useReader() {
     highlight,
     voice,
     speed,
+    perf,
     engine,
     deviceVoices,
     deviceVoiceUri,
@@ -625,6 +656,7 @@ export function useReader() {
     jumpTo,
     setSpeed,
     setVoice,
+    setPerf,
     setEngine,
     setDeviceVoiceUri,
     retryModel,

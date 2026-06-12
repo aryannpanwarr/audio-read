@@ -1,6 +1,7 @@
 import { formatTime } from '../lib/estimate'
 import { SPEED_OPTIONS, VOICE_OPTIONS } from '../tts/voices'
 import { hasDeviceTts } from '../tts/deviceTts'
+import { PERF_OPTIONS, type Perf } from '../tts/ttsClient'
 import type { Engine, ModelStatus, Phase } from '../hooks/useReader'
 
 interface Props {
@@ -11,6 +12,7 @@ interface Props {
   deviceVoices: SpeechSynthesisVoice[]
   deviceVoiceUri: string
   speed: number
+  perf: Perf
   times: { total: number; remaining: number }
   onPlay: () => void
   onPause: () => void
@@ -18,6 +20,7 @@ interface Props {
   onVoice: (v: string) => void
   onDeviceVoice: (uri: string) => void
   onSpeed: (v: number) => void
+  onPerf: (p: Perf) => void
 }
 
 export function Controls({
@@ -28,6 +31,7 @@ export function Controls({
   deviceVoices,
   deviceVoiceUri,
   speed,
+  perf,
   times,
   onPlay,
   onPause,
@@ -35,6 +39,7 @@ export function Controls({
   onVoice,
   onDeviceVoice,
   onSpeed,
+  onPerf,
 }: Props) {
   const playing = phase === 'playing' || phase === 'buffering'
   const canPlay = engine === 'device' || modelStatus === 'ready'
@@ -92,6 +97,22 @@ export function Controls({
           ))}
         </select>
       </label>
+
+      {engine === 'kokoro' && (
+        <label
+          className="control-field"
+          title="If playback stutters, try another preset — changing it reloads the model"
+        >
+          <span>Performance</span>
+          <select value={perf} onChange={(e) => onPerf(e.target.value as Perf)}>
+            {PERF_OPTIONS.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
 
       <div className="time-display" title="Estimated from reading speed">
         <strong>{formatTime(times.remaining)}</strong> left&nbsp;·&nbsp;≈{formatTime(times.total)} total

@@ -55,6 +55,7 @@ export interface Prefs {
   voice?: string
   speed?: number
   deviceVoice?: string
+  perf?: string
 }
 
 export function loadPrefs(): Prefs {
