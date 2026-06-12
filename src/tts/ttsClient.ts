@@ -57,9 +57,17 @@ export class TtsClient {
       // fallback ladder: a failed attempt leaves the worker unusable, so each
       // retry starts a fresh worker. threads:1 covers browsers where
       // multithreaded WASM (SharedArrayBuffer) crashes.
+      const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
       const attempts: { device: 'webgpu' | 'wasm'; threads?: number; dtype?: string }[] =
         device === 'webgpu'
-          ? [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
+          ? [
+              // phones: fp16 first — half the download and, critically, half
+              // the GPU memory (fp32 risks crashing mobile tabs)
+              ...(mobile ? [{ device: 'webgpu' as const, dtype: 'fp16' }] : []),
+              { device: 'webgpu' },
+              { device: 'wasm' },
+              { device: 'wasm', threads: 1 },
+            ]
           : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
       // testing hook: ?dtype=fp16 etc. tries that variant first
       const dtypeOverride = new URLSearchParams(location.search).get('dtype')
