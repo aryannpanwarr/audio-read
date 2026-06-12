@@ -54,21 +54,39 @@ export class TtsClient {
     if (this.initPromise) return this.initPromise
     this.initPromise = (async () => {
       const device = await pickDevice()
-      try {
-        return await this.initWith(device, onProgress)
-      } catch (e) {
-        if (device !== 'webgpu') throw e
-        // a failed WebGPU init leaves the worker unusable — start fresh on WASM
-        console.warn('WebGPU init failed, retrying with WASM in a fresh worker:', e)
-        this.worker.terminate()
-        this.worker = this.startWorker()
-        return await this.initWith('wasm', onProgress)
+      // fallback ladder: a failed attempt leaves the worker unusable, so each
+      // retry starts a fresh worker. threads:1 covers browsers where
+      // multithreaded WASM (SharedArrayBuffer) crashes.
+      const attempts: { device: 'webgpu' | 'wasm'; threads?: number }[] =
+        device === 'webgpu'
+          ? [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
+          : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
+      let lastError: unknown
+      for (const attempt of attempts) {
+        try {
+          return await this.initWith(attempt.device, onProgress, attempt.threads)
+        } catch (e) {
+          lastError = e
+          console.warn('TTS init failed for', attempt, e)
+          this.worker.terminate()
+          this.worker = this.startWorker()
+        }
       }
+      throw lastError instanceof Error ? lastError : new Error(String(lastError))
     })()
     return this.initPromise
   }
 
-  private initWith(device: 'webgpu' | 'wasm', onProgress: (p: ProgressInfo) => void): Promise<string> {
+  /** Terminate the worker; the client is unusable afterwards. */
+  dispose() {
+    this.worker.terminate()
+  }
+
+  private initWith(
+    device: 'webgpu' | 'wasm',
+    onProgress: (p: ProgressInfo) => void,
+    threads?: number,
+  ): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       this.worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
         const msg = e.data
@@ -100,8 +118,9 @@ export class TtsClient {
             break
         }
       }
-      this.worker.onerror = (e) => reject(new Error(e.message || 'TTS worker crashed'))
-      this.send({ type: 'init', device })
+      this.worker.onerror = (e) =>
+        reject(new Error(e.message || `TTS worker failed to start (${e.filename || 'no details'})`))
+      this.send({ type: 'init', device, threads })
     })
   }
 

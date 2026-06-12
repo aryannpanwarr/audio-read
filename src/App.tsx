@@ -35,7 +35,22 @@ export default function App() {
       {reader.engine === 'kokoro' && reader.modelStatus === 'loading' && (
         <ModelLoadingBar loaded={reader.modelProgress.loaded} total={reader.modelProgress.total} />
       )}
-      {reader.error && <p className="error banner">{reader.error}</p>}
+      {reader.error && (
+        <p className="error banner">
+          {reader.error}
+          {reader.engine === 'kokoro' && reader.modelStatus === 'idle' && (
+            <>
+              {' '}
+              <button className="retry-btn" onClick={reader.retryModel}>
+                Retry
+              </button>{' '}
+              <button className="retry-btn" onClick={() => reader.setEngine('device')}>
+                Use device voices instead
+              </button>
+            </>
+          )}
+        </p>
+      )}
 
       <ReaderView
         sentences={reader.sentences}

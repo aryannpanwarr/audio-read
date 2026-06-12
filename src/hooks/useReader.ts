@@ -332,6 +332,9 @@ export function useReader() {
     if (engineRef.current !== 'kokoro') return
     if (modelStatusRef.current !== 'idle') return
     setModelStatus('loading')
+    setError(null)
+    progressFilesRef.current.clear()
+    setModelProgress({ loaded: 0, total: 0 })
     if (!ttsRef.current) ttsRef.current = new TtsClient()
     ttsRef.current
       .init((p) => {
@@ -350,10 +353,16 @@ export function useReader() {
         prefetchFrom(currentRef.current)
       })
       .catch((e: Error) => {
+        // the worker is dead — throw the client away so Retry starts clean
+        ttsRef.current?.dispose()
+        ttsRef.current = null
         setModelStatus('idle')
         setError(`Failed to load the voice model: ${e.message}`)
       })
   }
+
+  /** Retry a failed model load (the worker is recreated from scratch). */
+  const retryModel = () => initModel()
 
   const loadDocument = async (file: File) => {
     setError(null)
@@ -475,6 +484,7 @@ export function useReader() {
     setVoice,
     setEngine,
     setDeviceVoiceUri,
+    retryModel,
     reset,
   }
 }

@@ -17,7 +17,7 @@ export interface Sentence {
 }
 
 export type WorkerRequest =
-  | { type: 'init'; device: 'webgpu' | 'wasm' }
+  | { type: 'init'; device: 'webgpu' | 'wasm'; threads?: number }
   | { type: 'synthesize'; id: number; text: string; voice: string; speed: number }
   | { type: 'cancel' }
 
