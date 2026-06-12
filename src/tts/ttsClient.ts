@@ -57,14 +57,17 @@ export class TtsClient {
       // fallback ladder: a failed attempt leaves the worker unusable, so each
       // retry starts a fresh worker. threads:1 covers browsers where
       // multithreaded WASM (SharedArrayBuffer) crashes.
-      const attempts: { device: 'webgpu' | 'wasm'; threads?: number }[] =
+      const attempts: { device: 'webgpu' | 'wasm'; threads?: number; dtype?: string }[] =
         device === 'webgpu'
           ? [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
           : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
+      // testing hook: ?dtype=fp16 etc. tries that variant first
+      const dtypeOverride = new URLSearchParams(location.search).get('dtype')
+      if (dtypeOverride) attempts.unshift({ device, dtype: dtypeOverride })
       let lastError: unknown
       for (const attempt of attempts) {
         try {
-          return await this.initWith(attempt.device, onProgress, attempt.threads)
+          return await this.initWith(attempt.device, onProgress, attempt.threads, attempt.dtype)
         } catch (e) {
           lastError = e
           console.warn('TTS init failed for', attempt, e)
@@ -86,6 +89,7 @@ export class TtsClient {
     device: 'webgpu' | 'wasm',
     onProgress: (p: ProgressInfo) => void,
     threads?: number,
+    dtype?: string,
   ): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       this.worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
@@ -120,7 +124,7 @@ export class TtsClient {
       }
       this.worker.onerror = (e) =>
         reject(new Error(e.message || `TTS worker failed to start (${e.filename || 'no details'})`))
-      this.send({ type: 'init', device, threads })
+      this.send({ type: 'init', device, threads, dtype })
     })
   }
 

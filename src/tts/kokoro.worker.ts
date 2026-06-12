@@ -19,10 +19,12 @@ let tts: KokoroTTS | null = null
 let busy = false
 const queue: Extract<WorkerRequest, { type: 'synthesize' }>[] = []
 
-function load(device: 'webgpu' | 'wasm') {
+type Dtype = NonNullable<Parameters<typeof KokoroTTS.from_pretrained>[1]>['dtype']
+
+function load(device: 'webgpu' | 'wasm', dtype?: string) {
   return KokoroTTS.from_pretrained(MODEL_ID, {
     // q8 is broken on WebGPU in transformers.js, so fp32 there; q8 keeps the WASM download small
-    dtype: device === 'webgpu' ? 'fp32' : 'q8',
+    dtype: (dtype as Dtype) ?? (device === 'webgpu' ? 'fp32' : 'q8'),
     device,
     progress_callback: (p) => {
       if (p.status === 'progress') {
@@ -32,13 +34,13 @@ function load(device: 'webgpu' | 'wasm') {
   })
 }
 
-async function init(device: 'webgpu' | 'wasm', threads?: number) {
+async function init(device: 'webgpu' | 'wasm', threads?: number, dtype?: string) {
   // multithreaded WASM crashes on some browsers — the client can retry
   // with threads pinned to 1
   if (threads && hfEnv.backends.onnx.wasm) hfEnv.backends.onnx.wasm.numThreads = threads
   // no in-worker fallback: a failed WebGPU init leaves onnxruntime in a broken
   // state, so the client recreates the whole worker and retries with WASM
-  tts = await load(device)
+  tts = await load(device, dtype)
   post({ type: 'ready', device: threads === 1 ? `${device} (1 thread)` : device })
   pump()
 }
@@ -69,7 +71,7 @@ async function pump() {
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data
   if (msg.type === 'init') {
-    init(msg.device, msg.threads).catch((err) =>
+    init(msg.device, msg.threads, msg.dtype).catch((err) =>
       post({ type: 'error', message: err instanceof Error ? err.message : String(err) }),
     )
   } else if (msg.type === 'synthesize') {
