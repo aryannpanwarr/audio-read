@@ -18,7 +18,8 @@ export interface Highlight {
   w: number
 }
 
-const PREFETCH_AHEAD = 2
+const PREFETCH_MIN = 3
+const PREFETCH_MAX = 8
 const CACHE_LIMIT = 24
 
 interface AudioChunk {
@@ -57,6 +58,7 @@ export function useReader() {
   const [modelProgress, setModelProgress] = useState({ loaded: 0, total: 0 })
   const [device, setDevice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [hint, setHint] = useState<string | null>(null)
   const [times, setTimes] = useState({ total: 0, remaining: 0 })
 
   const phaseRef = useRef<Phase>('idle')
@@ -81,6 +83,8 @@ export function useReader() {
   const playerRef = useRef(new Player())
   const estimatorRef = useRef(new TimeEstimator())
   const progressFilesRef = useRef(new Map<string, ProgressInfo>())
+  const prefetchAheadRef = useRef(PREFETCH_MIN)
+  const gapCountRef = useRef(0)
 
   const setPhase = (p: Phase) => {
     phaseRef.current = p
@@ -174,8 +178,20 @@ export function useReader() {
 
   const prefetchFrom = (from: number) => {
     const epoch = epochRef.current
-    for (let i = from; i < Math.min(from + PREFETCH_AHEAD + 1, sentencesRef.current.length); i++) {
+    for (let i = from; i < Math.min(from + prefetchAheadRef.current, sentencesRef.current.length); i++) {
       void synthesizeSentence(i, epoch)
+    }
+  }
+
+  /** Playback outran synthesis: deepen the runway, and after repeated
+   * underruns tell the user this device can't keep up in real time. */
+  const registerGap = () => {
+    prefetchAheadRef.current = Math.min(PREFETCH_MAX, prefetchAheadRef.current + 2)
+    gapCountRef.current++
+    if (gapCountRef.current === 3 && engineRef.current === 'kokoro') {
+      setHint(
+        'Your device generates AI audio slower than it plays. For gap-free listening, switch the Engine to “Device”, or enable WebGPU in your browser (chrome://flags → “Unsafe WebGPU”).',
+      )
     }
   }
 
@@ -195,10 +211,11 @@ export function useReader() {
       if (e && c + 1 < e.chunks.length) {
         playChunk(i, c + 1)
       } else if (e && !e.complete) {
+        registerGap()
         setPhase('buffering')
         waitingForRef.current = { s: i, chunk: c + 1 }
       } else {
-        startSentence(i + 1)
+        startSentence(i + 1, true)
       }
     })
   }
@@ -251,7 +268,7 @@ export function useReader() {
 
   // ---------- shared playback control ----------
 
-  const startSentence = (i: number) => {
+  const startSentence = (i: number, viaChain = false) => {
     const sents = sentencesRef.current
     while (i < sents.length && failedRef.current.has(i)) i++
     if (i >= sents.length) {
@@ -264,6 +281,9 @@ export function useReader() {
     setCurrentSentence(i)
     setHighlight({ s: i, w: 0 })
     if (!cacheRef.current.get(i)) {
+      // an uncached sentence reached during continuous playback is an
+      // underrun (a user jump is not)
+      if (viaChain) registerGap()
       // cold start: this sentence's pieces enter the queue before prefetch
       setPhase('buffering')
       waitingForRef.current = { s: i, chunk: 0 }
@@ -391,6 +411,9 @@ export function useReader() {
   const setEngine = (e: Engine) => {
     if (e === engineRef.current) return
     stopAll()
+    gapCountRef.current = 0
+    prefetchAheadRef.current = PREFETCH_MIN
+    setHint(null)
     engineRef.current = e
     setEngineState(e)
     localStorage.setItem('audio-read-engine', e)
@@ -438,6 +461,9 @@ export function useReader() {
 
   const loadDocument = async (file: File) => {
     setError(null)
+    setHint(null)
+    gapCountRef.current = 0
+    prefetchAheadRef.current = PREFETCH_MIN
     setPhase('extracting')
     try {
       const [paragraphs, key] = await Promise.all([extractParagraphs(file), docKey(file)])
@@ -559,6 +585,8 @@ export function useReader() {
     modelProgress,
     device,
     error,
+    hint,
+    dismissHint: () => setHint(null),
     times,
     loadDocument,
     play,

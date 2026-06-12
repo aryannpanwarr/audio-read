@@ -69,6 +69,17 @@ body {
   max-width: 70ch;
 }
 
+.hint.banner {
+  text-align: center;
+  margin: 0.5rem auto;
+  max-width: 75ch;
+  padding: 0.5rem 1rem;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
 .retry-btn {
   border: 1px solid currentColor;
   background: transparent;

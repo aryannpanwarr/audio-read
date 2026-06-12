@@ -52,6 +52,18 @@ export default function App() {
         </p>
       )}
 
+      {reader.hint && (
+        <p className="hint banner">
+          {reader.hint}{' '}
+          <button className="retry-btn" onClick={() => reader.setEngine('device')}>
+            Switch to device voices
+          </button>{' '}
+          <button className="retry-btn" onClick={reader.dismissHint}>
+            Dismiss
+          </button>
+        </p>
+      )}
+
       <ReaderView
         sentences={reader.sentences}
         highlight={reader.highlight}
