@@ -69,6 +69,7 @@ type KokoroTtsModule = {
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
+  notifyPreparationDone(title: string, audioDurationSeconds: number): Promise<void>;
   record(message: string): Promise<void>;
   exportLogs(): Promise<string>;
 };
@@ -103,8 +104,9 @@ const VOICES = [
 
 const SAMPLE_TEXT =
   'Open a PDF or EPUB to start reading. Audio Read will highlight the current sentence as Kokoro reads through the document.';
-const INITIAL_BUFFER_SECONDS = 600;
+const INITIAL_BUFFER_SECONDS = 20;
 const BACKGROUND_BUFFER_SECONDS = 180;
+const LIBRARY_PREP_SECONDS = 600;
 const MAX_BUFFER_SENTENCES = 160;
 
 const describeError = (error: unknown) => {
@@ -279,15 +281,14 @@ function App() {
   const sentenceWindow = (startIndex: number) =>
     sentences.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
 
-  const prebufferFrom = async (startIndex: number, targetSeconds: number, visible: boolean) => {
-    const texts = sentenceWindow(startIndex);
+  const prebufferTexts = async (texts: string[], targetSeconds: number, visible: boolean, label: string) => {
     if (!texts.length) return null;
     visiblePrebufferRef.current = visible;
     try {
       if (visible) setStatus('Preparing audio buffer...');
       const result = await KokoroTts.prebuffer(texts, speakerId, speed, targetSeconds);
       recordLog(
-        `ui prebuffer done start=${startIndex} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
+        `ui prebuffer done label=${label} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
       );
       if (visible) {
         setStatus(`Prepared ${formatDuration(result.audioDurationSeconds)} audio`);
@@ -300,11 +301,34 @@ function App() {
     }
   };
 
+  const prebufferFrom = async (startIndex: number, targetSeconds: number, visible: boolean) =>
+    prebufferTexts(sentenceWindow(startIndex), targetSeconds, visible, `start=${startIndex}`);
+
   const startBackgroundBuffer = (startIndex: number) => {
     if (backgroundBufferingRef.current) return;
     backgroundBufferingRef.current = true;
     void prebufferFrom(startIndex, BACKGROUND_BUFFER_SECONDS, false)
       .catch(error => recordLog(`ui background prebuffer failed ${describeError(error)}`))
+      .finally(() => {
+        backgroundBufferingRef.current = false;
+      });
+  };
+
+  const startDocumentPreparation = (parsed: Sentence[], title: string) => {
+    const texts = parsed.slice(0, MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
+    if (!texts.length || backgroundBufferingRef.current) return;
+    backgroundBufferingRef.current = true;
+    recordLog(`ui library prepare started title=${title} sentences=${texts.length}`);
+    void ensureReady()
+      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${title}`))
+      .then(result => {
+        if (!result) return;
+        recordLog(
+          `ui library prepare done title=${title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
+        );
+        return KokoroTts.notifyPreparationDone(title, result.audioDurationSeconds);
+      })
+      .catch(error => recordLog(`ui library prepare failed ${describeError(error)}`))
       .finally(() => {
         backgroundBufferingRef.current = false;
       });
@@ -329,8 +353,9 @@ function App() {
       setSentences(parsed);
       setCurrent(0);
       setLastResult(null);
-      setStatus(`${doc.kind.toUpperCase()} loaded: ${parsed.length} sentences`);
+      setStatus(`${doc.kind.toUpperCase()} loaded: ${parsed.length} sentences · preparing audio`);
       recordLog(`ui document loaded title=${doc.title} kind=${doc.kind} sentences=${parsed.length}`);
+      startDocumentPreparation(parsed, doc.title);
     } catch (error) {
       const message = describeError(error);
       if (message.includes('DOCUMENT_PICK_CANCELLED')) {
@@ -352,7 +377,11 @@ function App() {
     setBusy(true);
     try {
       await ensureReady();
-      await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
+      if (backgroundBufferingRef.current) {
+        setStatus('Using background preparation...');
+      } else {
+        await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
+      }
       if (token !== playTokenRef.current) return;
       await KokoroTts.startPlaybackSession();
       startBackgroundBuffer(startIndex + 1);

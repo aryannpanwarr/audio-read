@@ -1,5 +1,9 @@
 package com.audioreadnative.tts
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -10,6 +14,7 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import androidx.core.content.ContextCompat
 import com.audioreadnative.AudioReadPlaybackService
+import com.audioreadnative.MainActivity
 import com.audioreadnative.PLAYBACK_COMMAND_ACTION
 import com.audioreadnative.PLAYBACK_COMMAND_EXTRA
 import androidx.core.content.FileProvider
@@ -36,6 +41,8 @@ import kotlin.math.max
 private const val TAG = "AudioReadKokoro"
 private const val MODEL_DIR = "kokoro-en-v0_19"
 private const val MAX_CACHED_AUDIO_SECONDS = 1_200.0
+private const val PREP_CHANNEL_ID = "audio_read_preparation"
+private const val PREP_NOTIFICATION_ID = 1307
 
 class KokoroTtsModule(
   private val reactContext: ReactApplicationContext
@@ -250,6 +257,35 @@ class KokoroTtsModule(
     } catch (e: Throwable) {
       LogStore.write(TAG, "stopPlaybackSession failed: ${e.stackTraceToString()}")
       promise.reject("PLAYBACK_SERVICE_STOP_FAILED", e.message, e)
+    }
+  }
+
+  @ReactMethod
+  fun notifyPreparationDone(title: String, audioDurationSeconds: Double, promise: Promise) {
+    try {
+      createPreparationChannel()
+      val openIntent = Intent(reactContext, MainActivity::class.java)
+      val pendingIntent = PendingIntent.getActivity(
+        reactContext,
+        0,
+        openIntent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+      val notification = Notification.Builder(reactContext, PREP_CHANNEL_ID)
+        .setContentTitle("Audio Read is ready")
+        .setContentText("${title.take(42)} · ${formatDurationForNotification(audioDurationSeconds)} prepared")
+        .setSmallIcon(android.R.drawable.ic_media_play)
+        .setContentIntent(pendingIntent)
+        .setAutoCancel(true)
+        .setOnlyAlertOnce(true)
+        .build()
+      val manager = reactContext.getSystemService(NotificationManager::class.java)
+      manager.notify(PREP_NOTIFICATION_ID, notification)
+      LogStore.write(TAG, "notifyPreparationDone title=$title audio=${"%.3f".format(audioDurationSeconds)}")
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "notifyPreparationDone failed: ${e.stackTraceToString()}")
+      promise.reject("PREPARATION_NOTIFY_FAILED", e.message, e)
     }
   }
 
@@ -471,6 +507,20 @@ class KokoroTtsModule(
     }
   }
 
+  private fun createPreparationChannel() {
+    if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+    val manager = reactContext.getSystemService(NotificationManager::class.java)
+    val channel = NotificationChannel(
+      PREP_CHANNEL_ID,
+      "Audio Read preparation",
+      NotificationManager.IMPORTANCE_DEFAULT,
+    ).apply {
+      description = "Notifies when document audio preparation is ready"
+      setShowBadge(false)
+    }
+    manager.createNotificationChannel(channel)
+  }
+
   private fun ensureAudioTrack(sampleRate: Int): AudioTrack {
     track?.let { return it }
 
@@ -551,6 +601,13 @@ private data class GeneratedAudio(
   val rtf: Double,
   val source: String,
 )
+
+private fun formatDurationForNotification(seconds: Double): String {
+  val totalSeconds = seconds.toInt().coerceAtLeast(0)
+  val minutes = totalSeconds / 60
+  val remainingSeconds = totalSeconds % 60
+  return "${minutes}m ${remainingSeconds}s"
+}
 
 private fun String.wordCount(): Int =
   trim().split(Regex("\\s+")).count { it.isNotBlank() }
