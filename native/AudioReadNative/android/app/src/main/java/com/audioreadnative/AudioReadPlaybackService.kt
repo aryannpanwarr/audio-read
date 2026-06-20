@@ -13,6 +13,11 @@ private const val CHANNEL_ID = "audio_read_playback"
 private const val NOTIFICATION_ID = 1207
 private const val ACTION_START = "com.audioreadnative.playback.START"
 private const val ACTION_STOP = "com.audioreadnative.playback.STOP"
+const val PLAYBACK_COMMAND_ACTION = "com.audioreadnative.playback.COMMAND"
+const val PLAYBACK_COMMAND_EXTRA = "command"
+const val PLAYBACK_COMMAND_PAUSE = "pause"
+const val PLAYBACK_COMMAND_PREVIOUS = "previous"
+const val PLAYBACK_COMMAND_NEXT = "next"
 
 class AudioReadPlaybackService : Service() {
   override fun onCreate() {
@@ -71,9 +76,36 @@ class AudioReadPlaybackService : Service() {
       .setContentText("Reading with Kokoro")
       .setSmallIcon(android.R.drawable.ic_media_play)
       .setContentIntent(pendingIntent)
+      .addAction(
+        android.R.drawable.ic_media_previous,
+        "Previous",
+        commandPendingIntent(PLAYBACK_COMMAND_PREVIOUS, 1),
+      )
+      .addAction(
+        android.R.drawable.ic_media_pause,
+        "Pause",
+        commandPendingIntent(PLAYBACK_COMMAND_PAUSE, 2),
+      )
+      .addAction(
+        android.R.drawable.ic_media_next,
+        "Next",
+        commandPendingIntent(PLAYBACK_COMMAND_NEXT, 3),
+      )
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .build()
+  }
+
+  private fun commandPendingIntent(command: String, requestCode: Int): PendingIntent {
+    val intent = Intent(PLAYBACK_COMMAND_ACTION)
+      .setPackage(packageName)
+      .putExtra(PLAYBACK_COMMAND_EXTRA, command)
+    return PendingIntent.getBroadcast(
+      this,
+      requestCode,
+      intent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
   }
 
   @Suppress("DEPRECATION")

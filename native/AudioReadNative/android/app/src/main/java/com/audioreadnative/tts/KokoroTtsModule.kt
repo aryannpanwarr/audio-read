@@ -1,12 +1,17 @@
 package com.audioreadnative.tts
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import androidx.core.content.ContextCompat
 import com.audioreadnative.AudioReadPlaybackService
+import com.audioreadnative.PLAYBACK_COMMAND_ACTION
+import com.audioreadnative.PLAYBACK_COMMAND_EXTRA
 import androidx.core.content.FileProvider
 import com.audioreadnative.LogStore
 import android.util.Log
@@ -15,6 +20,7 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.getOfflineTtsConfig
@@ -34,6 +40,23 @@ class KokoroTtsModule(
   private var tts: OfflineTts? = null
   private var track: AudioTrack? = null
   @Volatile private var stopped = false
+  private val commandReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      if (intent?.action != PLAYBACK_COMMAND_ACTION) return
+      val command = intent.getStringExtra(PLAYBACK_COMMAND_EXTRA) ?: return
+      LogStore.write(TAG, "playback command received command=$command")
+      emitPlaybackCommand(command)
+    }
+  }
+
+  init {
+    ContextCompat.registerReceiver(
+      reactContext,
+      commandReceiver,
+      IntentFilter(PLAYBACK_COMMAND_ACTION),
+      ContextCompat.RECEIVER_NOT_EXPORTED,
+    )
+  }
 
   override fun getName() = "KokoroTts"
 
@@ -153,6 +176,16 @@ class KokoroTtsModule(
   }
 
   @ReactMethod
+  fun addListener(eventName: String) {
+    LogStore.write(TAG, "js listener added event=$eventName")
+  }
+
+  @ReactMethod
+  fun removeListeners(count: Int) {
+    LogStore.write(TAG, "js listeners removed count=$count")
+  }
+
+  @ReactMethod
   fun record(message: String, promise: Promise) {
     LogStore.write("js", message)
     promise.resolve(null)
@@ -187,12 +220,22 @@ class KokoroTtsModule(
   override fun invalidate() {
     LogStore.write(TAG, "invalidate")
     stopped = true
+    try {
+      reactContext.unregisterReceiver(commandReceiver)
+    } catch (_: Throwable) {
+    }
     track?.release()
     track = null
     tts?.release()
     tts = null
     executor.shutdownNow()
     super.invalidate()
+  }
+
+  private fun emitPlaybackCommand(command: String) {
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit("AudioReadPlaybackCommand", command)
   }
 
   private fun ensureTts(): OfflineTts {

@@ -2,6 +2,7 @@ import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
   LayoutChangeEvent,
+  NativeEventEmitter,
   NativeModules,
   PermissionsAndroid,
   Platform,
@@ -135,6 +136,7 @@ function App() {
   const playTokenRef = useRef(0);
   const scrollRef = useRef<ScrollView>(null);
   const sentenceYRef = useRef<Record<number, number>>({});
+  const commandHandlerRef = useRef<(command: string) => void>(() => {});
 
   useEffect(() => {
     recordLog('reader app mounted');
@@ -143,6 +145,15 @@ function App() {
         recordLog(`notification permission request failed ${describeError(error)}`);
       });
     }
+  }, []);
+
+  useEffect(() => {
+    const emitter = new NativeEventEmitter(NativeModules.KokoroTts);
+    const subscription = emitter.addListener('AudioReadPlaybackCommand', command => {
+      recordLog(`ui playback command ${String(command)}`);
+      commandHandlerRef.current(String(command));
+    });
+    return () => subscription.remove();
   }, []);
 
   useEffect(() => {
@@ -272,6 +283,18 @@ function App() {
   const recordSentenceLayout = (id: number, event: LayoutChangeEvent) => {
     sentenceYRef.current[id] = event.nativeEvent.layout.y;
   };
+
+  useEffect(() => {
+    commandHandlerRef.current = command => {
+      if (command === 'pause') {
+        void playPause();
+      } else if (command === 'previous') {
+        void jump(current - 1);
+      } else if (command === 'next') {
+        void jump(current + 1);
+      }
+    };
+  });
 
   return (
     <SafeAreaView style={styles.screen}>
