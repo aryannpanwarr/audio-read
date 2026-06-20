@@ -73,22 +73,15 @@ class KokoroTtsModule(
         audioTrack.flush()
         audioTrack.play()
 
+        LogStore.write(TAG, "speak generating audio without native callback")
         val start = System.nanoTime()
-        val audio = model.generateWithConfigAndCallback(
+        val audio = model.generateWithConfig(
           text = cleanText,
           config = GenerationConfig(
             sid = max(0, speakerId),
             speed = speed.toFloat().coerceIn(0.5f, 2.0f),
             silenceScale = 0.2f,
           ),
-          callback = { samples ->
-            if (stopped) {
-              0
-            } else {
-              audioTrack.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-              1
-            }
-          },
         )
         val elapsed = (System.nanoTime() - start) / 1_000_000_000.0
         val audioDuration = audio.samples.size.toDouble() / audio.sampleRate.toDouble()
@@ -97,6 +90,11 @@ class KokoroTtsModule(
           TAG,
           "speak resolved elapsed=${"%.3f".format(elapsed)} audioDuration=${"%.3f".format(audioDuration)} rtf=${"%.3f".format(rtf)} samples=${audio.samples.size}",
         )
+        if (!stopped && audio.samples.isNotEmpty()) {
+          LogStore.write(TAG, "speak writing ${audio.samples.size} samples to AudioTrack")
+          audioTrack.write(audio.samples, 0, audio.samples.size, AudioTrack.WRITE_BLOCKING)
+          LogStore.write(TAG, "speak finished AudioTrack write")
+        }
 
         val map = Arguments.createMap()
         map.putDouble("elapsedSeconds", elapsed)
