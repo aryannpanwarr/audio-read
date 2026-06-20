@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class KokoroTtsPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-    return listOf(KokoroTtsModule(reactContext))
+    return listOf(KokoroTtsModule(reactContext), DocumentModule(reactContext))
   }
 
   override fun createViewManagers(

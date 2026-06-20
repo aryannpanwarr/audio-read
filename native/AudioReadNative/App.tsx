@@ -1,6 +1,7 @@
-import React, {useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
+  LayoutChangeEvent,
   NativeModules,
   Pressable,
   SafeAreaView,
@@ -8,7 +9,6 @@ import {
   StatusBar,
   StyleSheet,
   Text,
-  TextInput,
   View,
   useColorScheme,
 } from 'react-native';
@@ -27,6 +27,13 @@ type SpeakResult = {
   samples: number;
 };
 
+type PickedDocument = {
+  title: string;
+  text: string;
+  uri: string;
+  kind: 'pdf' | 'epub' | 'text';
+};
+
 type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
   speak(text: string, speakerId: number, speed: number): Promise<SpeakResult>;
@@ -35,7 +42,12 @@ type KokoroTtsModule = {
   exportLogs(): Promise<string>;
 };
 
+type DocumentReaderModule = {
+  pickDocument(): Promise<PickedDocument>;
+};
+
 const KokoroTts = NativeModules.KokoroTts as KokoroTtsModule;
+const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
 
 declare const global: {
   ErrorUtils?: {
@@ -43,6 +55,23 @@ declare const global: {
     setGlobalHandler?: (handler: (error: unknown, isFatal?: boolean) => void) => void;
   };
 };
+
+const VOICES = [
+  'Heart',
+  'Bella',
+  'Nicole',
+  'Sarah',
+  'Sky',
+  'Adam',
+  'Michael',
+  'Emma',
+  'Isabella',
+  'George',
+  'Lewis',
+];
+
+const SAMPLE_TEXT =
+  'Open a PDF or EPUB to start reading. Audio Read will highlight the current sentence as Kokoro reads through the document.';
 
 const describeError = (error: unknown) => {
   if (error instanceof Error) {
@@ -61,80 +90,159 @@ global.ErrorUtils?.setGlobalHandler?.((error, isFatal) => {
   previousErrorHandler?.(error, isFatal);
 });
 
-const SAMPLE =
-  'Today as always, men fall into two groups: slaves and free men. Whoever does not have two-thirds of his day for himself, is a slave.';
+type Sentence = {
+  id: number;
+  text: string;
+};
 
-const VOICES = [
-  'af',
-  'af_bella',
-  'af_nicole',
-  'af_sarah',
-  'af_sky',
-  'am_adam',
-  'am_michael',
-  'bf_emma',
-  'bf_isabella',
-  'bm_george',
-  'bm_lewis',
-];
+function splitSentences(text: string): Sentence[] {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const parts = normalized.match(/[^.!?]+[.!?]+["')\]]?|[^.!?]+$/g) ?? [normalized];
+  return parts
+    .map(part => part.trim())
+    .filter(part => part.length > 0)
+    .slice(0, 5000)
+    .map((part, index) => ({id: index, text: part}));
+}
+
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
 
 function App() {
   const dark = useColorScheme() === 'dark';
   const colors = dark ? darkColors : lightColors;
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const [text, setText] = useState(SAMPLE);
+  const [documentTitle, setDocumentTitle] = useState('Sample');
+  const [documentKind, setDocumentKind] = useState<'pdf' | 'epub' | 'text' | 'sample'>('sample');
+  const [sentences, setSentences] = useState<Sentence[]>(() => splitSentences(SAMPLE_TEXT));
+  const [current, setCurrent] = useState(0);
   const [speakerId, setSpeakerId] = useState(2);
   const [speed, setSpeed] = useState(1);
   const [ready, setReady] = useState<InitResult | null>(null);
-  const [result, setResult] = useState<SpeakResult | null>(null);
+  const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState('Not initialized');
+  const [status, setStatus] = useState('Open a PDF or EPUB to begin');
+  const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
+  const playTokenRef = useRef(0);
+  const scrollRef = useRef<ScrollView>(null);
+  const sentenceYRef = useRef<Record<number, number>>({});
 
-  const initialize = async () => {
+  useEffect(() => {
+    recordLog('reader app mounted');
+  }, []);
+
+  useEffect(() => {
+    const y = sentenceYRef.current[current];
+    if (typeof y === 'number') {
+      scrollRef.current?.scrollTo({y: Math.max(0, y - 80), animated: true});
+    }
+  }, [current]);
+
+  const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
+
+  const ensureReady = async () => {
+    if (ready) return ready;
+    setStatus('Loading Kokoro model...');
+    const info = await KokoroTts.initialize();
+    setReady(info);
+    setStatus(`Kokoro ready: ${info.sampleRate} Hz`);
+    return info;
+  };
+
+  const openDocument = async () => {
     try {
-      recordLog('ui initialize pressed');
+      recordLog('ui open document pressed');
       setBusy(true);
-      setStatus('Loading Kokoro model...');
-      const info = await KokoroTts.initialize();
-      recordLog(`ui initialize resolved sampleRate=${info.sampleRate} speakers=${info.speakers}`);
-      setReady(info);
-      setStatus(`Ready: ${info.model}, ${info.sampleRate} Hz, ${info.speakers} voices`);
+      setStatus('Opening document...');
+      const doc = await DocumentReader.pickDocument();
+      const parsed = splitSentences(doc.text);
+      if (!parsed.length) throw new Error('No readable sentences found in this document');
+      playTokenRef.current++;
+      await KokoroTts.stop();
+      setPlaying(false);
+      setDocumentTitle(doc.title);
+      setDocumentKind(doc.kind);
+      sentenceYRef.current = {};
+      setSentences(parsed);
+      setCurrent(0);
+      setLastResult(null);
+      setStatus(`${doc.kind.toUpperCase()} loaded: ${parsed.length} sentences`);
+      recordLog(`ui document loaded title=${doc.title} kind=${doc.kind} sentences=${parsed.length}`);
     } catch (error) {
       const message = describeError(error);
-      recordLog(`ui initialize failed ${message}`);
-      setStatus('Initialization failed');
-      Alert.alert('Kokoro failed to initialize', message);
+      if (message.includes('DOCUMENT_PICK_CANCELLED')) {
+        setStatus('Ready');
+      } else {
+        Alert.alert('Could not open document', message);
+        setStatus('Document open failed');
+      }
+      recordLog(`ui open document failed ${message}`);
     } finally {
       setBusy(false);
     }
   };
 
-  const speak = async () => {
+  const speakAt = async (startIndex: number) => {
+    if (!sentences.length) return;
+    const token = ++playTokenRef.current;
+    setPlaying(true);
+    setBusy(true);
     try {
-      recordLog(`ui speak pressed chars=${text.length} speakerId=${speakerId} speed=${speed}`);
-      setBusy(true);
-      setResult(null);
-      setStatus('Synthesizing and streaming audio...');
-      const metrics = await KokoroTts.speak(text, speakerId, speed);
-      recordLog(`ui speak resolved rtf=${metrics.rtf.toFixed(3)} elapsed=${metrics.elapsedSeconds.toFixed(3)}`);
-      setResult(metrics);
-      setStatus(metrics.rtf < 1 ? 'Pass: faster than real time' : 'Slow: slower than playback');
+      await ensureReady();
+      for (let index = startIndex; index < sentences.length; index++) {
+        if (token !== playTokenRef.current) return;
+        const sentence = sentences[index];
+        setCurrent(index);
+        setStatus(`Reading ${index + 1} of ${sentences.length}`);
+        recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
+        const result = await KokoroTts.speak(sentence.text, speakerId, speed);
+        if (token !== playTokenRef.current) return;
+        setLastResult(result);
+      }
+      setStatus('Finished');
+      setPlaying(false);
     } catch (error) {
       const message = describeError(error);
-      recordLog(`ui speak failed ${message}`);
-      setStatus('Synthesis failed');
-      Alert.alert('Kokoro synthesis failed', message);
+      setStatus('Playback failed');
+      setPlaying(false);
+      Alert.alert('Playback failed', message);
+      recordLog(`ui playback failed ${message}`);
     } finally {
-      setBusy(false);
+      if (token === playTokenRef.current) {
+        setBusy(false);
+      }
     }
   };
 
-  const stop = async () => {
-    recordLog('ui stop pressed');
+  const playPause = async () => {
+    if (busy && !playing) return;
+    if (playing) {
+      recordLog('ui pause pressed');
+      playTokenRef.current++;
+      setPlaying(false);
+      setBusy(false);
+      await KokoroTts.stop();
+      setStatus('Paused');
+      return;
+    }
+    recordLog(`ui play pressed current=${current}`);
+    void speakAt(current);
+  };
+
+  const jump = async (next: number) => {
+    const bounded = Math.max(0, Math.min(sentences.length - 1, next));
+    recordLog(`ui jump ${current}->${bounded}`);
+    playTokenRef.current++;
     await KokoroTts.stop();
+    setCurrent(bounded);
+    setPlaying(false);
     setBusy(false);
-    setStatus('Stopped');
+    setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
   };
 
   const exportLogs = async () => {
@@ -142,131 +250,139 @@ function App() {
       recordLog('ui export logs pressed');
       await KokoroTts.exportLogs();
     } catch (error) {
-      const message = describeError(error);
-      Alert.alert('Could not export logs', message);
+      Alert.alert('Could not export logs', describeError(error));
     }
+  };
+
+  const recordSentenceLayout = (id: number, event: LayoutChangeEvent) => {
+    sentenceYRef.current[id] = event.nativeEvent.layout.y;
   };
 
   return (
     <SafeAreaView style={styles.screen}>
-      <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <Text style={styles.title}>Audio Read Native</Text>
-        <Text style={styles.subtitle}>Kokoro on-device benchmark for OnePlus 11R</Text>
-
-        <View style={styles.panel}>
-          <Text style={styles.label}>Text</Text>
-          <TextInput
-            multiline
-            value={text}
-            onChangeText={setText}
-            style={styles.input}
-            placeholder="Enter text to synthesize"
-            placeholderTextColor={colors.muted}
-          />
+      <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
+      <View style={styles.header}>
+        <View style={styles.logo}>
+          <Text style={styles.logoText}>AR</Text>
         </View>
-
-        <View style={styles.row}>
-          <View style={styles.stepper}>
-            <Text style={styles.label}>Voice</Text>
-            <View style={styles.stepperRow}>
-              <Pressable
-                style={styles.smallButton}
-                onPress={() => setSpeakerId(Math.max(0, speakerId - 1))}
-                disabled={busy}>
-                <Text style={styles.buttonText}>-</Text>
-              </Pressable>
-              <Text style={styles.value}>
-                {speakerId} {VOICES[speakerId] ?? ''}
-              </Text>
-              <Pressable
-                style={styles.smallButton}
-                onPress={() => setSpeakerId(Math.min(10, speakerId + 1))}
-                disabled={busy}>
-                <Text style={styles.buttonText}>+</Text>
-              </Pressable>
-            </View>
-          </View>
-
-          <View style={styles.stepper}>
-            <Text style={styles.label}>Speed</Text>
-            <View style={styles.stepperRow}>
-              <Pressable
-                style={styles.smallButton}
-                onPress={() => setSpeed(Math.max(0.5, Number((speed - 0.1).toFixed(1))))}
-                disabled={busy}>
-                <Text style={styles.buttonText}>-</Text>
-              </Pressable>
-              <Text style={styles.value}>{speed.toFixed(1)}x</Text>
-              <Pressable
-                style={styles.smallButton}
-                onPress={() => setSpeed(Math.min(2, Number((speed + 0.1).toFixed(1))))}
-                disabled={busy}>
-                <Text style={styles.buttonText}>+</Text>
-              </Pressable>
-            </View>
-          </View>
+        <View style={styles.headerText}>
+          <Text style={styles.title}>Audio Read</Text>
+          <Text style={styles.subtitle} numberOfLines={1}>
+            {documentTitle} · {documentKind.toUpperCase()}
+          </Text>
         </View>
+        <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
+          <Text style={styles.openButtonText}>Open</Text>
+        </Pressable>
+      </View>
 
-        <View style={styles.actions}>
-          <Pressable style={[styles.button, busy && styles.disabled]} onPress={initialize} disabled={busy}>
-            <Text style={styles.buttonText}>{ready ? 'Reload Model' : 'Initialize'}</Text>
+      <View style={styles.progressTrack}>
+        <View style={[styles.progressFill, {width: `${progress}%`}]} />
+      </View>
+
+      <ScrollView ref={scrollRef} contentContainerStyle={styles.readerContent}>
+        {sentences.map(sentence => (
+          <Pressable
+            key={sentence.id}
+            onPress={() => jump(sentence.id)}
+            onLayout={event => recordSentenceLayout(sentence.id, event)}>
+            <Text style={[styles.sentence, sentence.id === current && styles.currentSentence]}>
+              {sentence.text}
+            </Text>
+          </Pressable>
+        ))}
+      </ScrollView>
+
+      <View style={styles.bottomBar}>
+        <Text style={styles.status} numberOfLines={2}>
+          {status}
+        </Text>
+
+        <View style={styles.controls}>
+          <Pressable style={styles.iconButton} onPress={() => jump(current - 1)} disabled={busy || current === 0}>
+            <Text style={styles.iconButtonText}>‹</Text>
           </Pressable>
           <Pressable
-            style={[styles.button, (!ready || busy) && styles.disabled]}
-            onPress={speak}
-            disabled={!ready || busy}>
-            <Text style={styles.buttonText}>Speak</Text>
+            style={[styles.playButton, busy && !playing && styles.disabled]}
+            onPress={playPause}
+            disabled={busy && !playing}>
+            <Text style={styles.playButtonText}>{playing ? 'Pause' : ready ? 'Play' : 'Load & Play'}</Text>
           </Pressable>
-          <Pressable style={styles.secondaryButton} onPress={stop}>
-            <Text style={styles.secondaryButtonText}>Stop</Text>
+          <Pressable
+            style={styles.iconButton}
+            onPress={() => jump(current + 1)}
+            disabled={busy || current >= sentences.length - 1}>
+            <Text style={styles.iconButtonText}>›</Text>
           </Pressable>
         </View>
 
-        <Pressable style={styles.logButton} onPress={exportLogs}>
-          <Text style={styles.logButtonText}>Export logs</Text>
-        </Pressable>
-
-        <View style={styles.panel}>
-          <Text style={styles.label}>Status</Text>
-          <Text style={styles.status}>{status}</Text>
-          {result && (
-            <View style={styles.metrics}>
-              <Text style={styles.metric}>Elapsed: {result.elapsedSeconds.toFixed(2)}s</Text>
-              <Text style={styles.metric}>Audio: {result.audioDurationSeconds.toFixed(2)}s</Text>
-              <Text style={[styles.metric, result.rtf < 1 ? styles.good : styles.bad]}>
-                RTF: {result.rtf.toFixed(2)} {result.rtf < 1 ? '(good)' : '(too slow)'}
-              </Text>
+        <View style={styles.optionsRow}>
+          <View style={styles.optionBox}>
+            <Text style={styles.optionLabel}>Voice</Text>
+            <View style={styles.stepperRow}>
+              <Pressable onPress={() => setSpeakerId(Math.max(0, speakerId - 1))} disabled={playing}>
+                <Text style={styles.stepperText}>-</Text>
+              </Pressable>
+              <Text style={styles.optionValue}>{VOICES[speakerId] ?? speakerId}</Text>
+              <Pressable onPress={() => setSpeakerId(Math.min(10, speakerId + 1))} disabled={playing}>
+                <Text style={styles.stepperText}>+</Text>
+              </Pressable>
             </View>
-          )}
+          </View>
+          <View style={styles.optionBox}>
+            <Text style={styles.optionLabel}>Speed</Text>
+            <View style={styles.stepperRow}>
+              <Pressable
+                onPress={() => setSpeed(Math.max(0.7, Number((speed - 0.1).toFixed(1))))}
+                disabled={playing}>
+                <Text style={styles.stepperText}>-</Text>
+              </Pressable>
+              <Text style={styles.optionValue}>{speed.toFixed(1)}x</Text>
+              <Pressable
+                onPress={() => setSpeed(Math.min(1.5, Number((speed + 0.1).toFixed(1))))}
+                disabled={playing}>
+                <Text style={styles.stepperText}>+</Text>
+              </Pressable>
+            </View>
+          </View>
+          <Pressable style={styles.logButton} onPress={exportLogs}>
+            <Text style={styles.logButtonText}>Logs</Text>
+          </Pressable>
         </View>
-      </ScrollView>
+
+        <Text style={styles.meta}>
+          {sentences.length ? `${current + 1}/${sentences.length}` : '0/0'}
+          {lastResult ? ` · RTF ${lastResult.rtf.toFixed(2)} · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
+        </Text>
+      </View>
     </SafeAreaView>
   );
 }
 
 const lightColors = {
-  bg: '#f7f7f4',
-  panel: '#ffffff',
-  text: '#1f2430',
-  muted: '#6b7280',
-  border: '#deded8',
-  accent: '#2563eb',
+  bg: '#f5f3ee',
+  surface: '#fffdf8',
+  surface2: '#ebe7df',
+  text: '#202124',
+  muted: '#6f6b63',
+  border: '#ddd6c8',
+  accent: '#155e75',
+  accent2: '#d97706',
   accentText: '#ffffff',
-  good: '#047857',
-  bad: '#b91c1c',
+  highlight: '#fff2bf',
 };
 
 const darkColors = {
-  bg: '#111315',
-  panel: '#1b1f23',
-  text: '#f3f4f6',
-  muted: '#9ca3af',
-  border: '#31363d',
-  accent: '#3b82f6',
-  accentText: '#ffffff',
-  good: '#34d399',
-  bad: '#f87171',
+  bg: '#101413',
+  surface: '#171c1b',
+  surface2: '#26302e',
+  text: '#f4f1ea',
+  muted: '#aaa49a',
+  border: '#303936',
+  accent: '#22d3ee',
+  accent2: '#f59e0b',
+  accentText: '#062426',
+  highlight: '#4a3d18',
 };
 
 function makeStyles(colors: typeof lightColors) {
@@ -275,144 +391,193 @@ function makeStyles(colors: typeof lightColors) {
       flex: 1,
       backgroundColor: colors.bg,
     },
-    content: {
-      padding: 20,
-      gap: 16,
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+      paddingHorizontal: 18,
+      paddingTop: 12,
+      paddingBottom: 12,
+      backgroundColor: colors.surface,
+      borderBottomColor: colors.border,
+      borderBottomWidth: 1,
+    },
+    logo: {
+      width: 42,
+      height: 42,
+      borderRadius: 10,
+      backgroundColor: colors.accent,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    logoText: {
+      color: colors.accentText,
+      fontWeight: '800',
+      fontSize: 16,
+    },
+    headerText: {
+      flex: 1,
     },
     title: {
       color: colors.text,
-      fontSize: 28,
-      fontWeight: '700',
+      fontSize: 22,
+      fontWeight: '800',
     },
     subtitle: {
       color: colors.muted,
-      fontSize: 15,
-      marginTop: -8,
+      fontSize: 13,
+      marginTop: 2,
     },
-    panel: {
-      backgroundColor: colors.panel,
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 8,
-      padding: 14,
-      gap: 8,
-    },
-    label: {
-      color: colors.muted,
-      fontSize: 12,
-      fontWeight: '700',
-      textTransform: 'uppercase',
-    },
-    input: {
-      minHeight: 150,
-      color: colors.text,
-      fontSize: 17,
-      lineHeight: 24,
-      textAlignVertical: 'top',
-    },
-    row: {
-      flexDirection: 'row',
-      gap: 12,
-    },
-    stepper: {
-      flex: 1,
-      backgroundColor: colors.panel,
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 8,
-      padding: 14,
-      gap: 10,
-    },
-    stepperRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      gap: 8,
-    },
-    value: {
-      flex: 1,
-      color: colors.text,
-      fontSize: 15,
-      fontWeight: '600',
-      textAlign: 'center',
-    },
-    actions: {
-      flexDirection: 'row',
-      gap: 10,
-    },
-    button: {
-      flex: 1,
-      minHeight: 48,
+    openButton: {
       backgroundColor: colors.accent,
-      borderRadius: 8,
-      alignItems: 'center',
-      justifyContent: 'center',
-      paddingHorizontal: 12,
-    },
-    smallButton: {
-      width: 38,
-      height: 38,
-      backgroundColor: colors.accent,
-      borderRadius: 8,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    secondaryButton: {
-      minHeight: 48,
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 8,
-      alignItems: 'center',
-      justifyContent: 'center',
-      paddingHorizontal: 18,
-    },
-    buttonText: {
-      color: colors.accentText,
-      fontSize: 16,
-      fontWeight: '700',
-    },
-    secondaryButtonText: {
-      color: colors.text,
-      fontSize: 16,
-      fontWeight: '700',
-    },
-    logButton: {
-      minHeight: 46,
-      borderColor: colors.accent,
-      borderWidth: 1,
-      borderRadius: 8,
-      alignItems: 'center',
-      justifyContent: 'center',
       paddingHorizontal: 16,
+      minHeight: 40,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
-    logButtonText: {
-      color: colors.accent,
-      fontSize: 16,
+    openButtonText: {
+      color: colors.accentText,
+      fontSize: 15,
+      fontWeight: '800',
+    },
+    progressTrack: {
+      height: 4,
+      backgroundColor: colors.surface2,
+    },
+    progressFill: {
+      height: 4,
+      backgroundColor: colors.accent2,
+    },
+    readerContent: {
+      padding: 22,
+      paddingBottom: 260,
+      gap: 10,
+    },
+    sentence: {
+      color: colors.text,
+      fontSize: 19,
+      lineHeight: 32,
+      borderRadius: 6,
+      paddingHorizontal: 4,
+      paddingVertical: 2,
+    },
+    currentSentence: {
+      backgroundColor: colors.highlight,
+      color: colors.text,
       fontWeight: '700',
     },
-    disabled: {
-      opacity: 0.45,
+    bottomBar: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      bottom: 0,
+      padding: 14,
+      paddingBottom: 18,
+      backgroundColor: colors.surface,
+      borderTopColor: colors.border,
+      borderTopWidth: 1,
+      gap: 10,
     },
     status: {
       color: colors.text,
+      fontSize: 14,
+      textAlign: 'center',
+    },
+    controls: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 12,
+    },
+    iconButton: {
+      width: 48,
+      height: 48,
+      borderRadius: 24,
+      backgroundColor: colors.surface2,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    iconButtonText: {
+      color: colors.text,
+      fontSize: 32,
+      lineHeight: 36,
+    },
+    playButton: {
+      minWidth: 140,
+      minHeight: 50,
+      borderRadius: 25,
+      backgroundColor: colors.accent,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 20,
+    },
+    playButtonText: {
+      color: colors.accentText,
+      fontWeight: '800',
       fontSize: 16,
     },
-    metrics: {
-      marginTop: 8,
-      gap: 4,
+    optionsRow: {
+      flexDirection: 'row',
+      gap: 8,
     },
-    metric: {
+    optionBox: {
+      flex: 1,
+      borderColor: colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
+      backgroundColor: colors.bg,
+    },
+    optionLabel: {
+      color: colors.muted,
+      fontSize: 10,
+      fontWeight: '800',
+      textTransform: 'uppercase',
+      textAlign: 'center',
+      marginBottom: 4,
+    },
+    optionValue: {
       color: colors.text,
-      fontSize: 15,
+      fontWeight: '800',
+      fontSize: 13,
+      minWidth: 62,
+      textAlign: 'center',
+    },
+    stepperRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    stepperText: {
+      color: colors.accent,
+      fontSize: 22,
+      fontWeight: '900',
+      paddingHorizontal: 6,
+    },
+    logButton: {
+      width: 64,
+      borderColor: colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.bg,
+    },
+    logButtonText: {
+      color: colors.accent,
+      fontWeight: '800',
+      fontSize: 13,
+    },
+    meta: {
+      color: colors.muted,
+      fontSize: 12,
+      textAlign: 'center',
       fontVariant: ['tabular-nums'],
     },
-    good: {
-      color: colors.good,
-      fontWeight: '700',
-    },
-    bad: {
-      color: colors.bad,
-      fontWeight: '700',
+    disabled: {
+      opacity: 0.5,
     },
   });
 }
