@@ -37,6 +37,24 @@ type PickedDocument = {
   kind: 'pdf' | 'epub' | 'text';
 };
 
+type LibraryBook = {
+  id: string;
+  title: string;
+  kind: 'pdf' | 'epub' | 'text';
+  uri: string;
+  sentenceCount: number;
+  charCount: number;
+  createdAt: number;
+  updatedAt: number;
+  lastPosition: number;
+  preparedAudioSeconds: number;
+  cacheStatus: string;
+};
+
+type LoadedLibraryBook = LibraryBook & {
+  text: string;
+};
+
 type SpeechTiming = {
   audioDurationSeconds: number;
   wordCount: number;
@@ -76,6 +94,17 @@ type KokoroTtsModule = {
 
 type DocumentReaderModule = {
   pickDocument(): Promise<PickedDocument>;
+  listLibrary(): Promise<LibraryBook[]>;
+  saveLibraryDocument(
+    title: string,
+    kind: string,
+    uri: string,
+    text: string,
+    sentenceCount: number,
+  ): Promise<LibraryBook>;
+  loadLibraryDocument(id: string): Promise<LoadedLibraryBook>;
+  updateLibraryDocument(id: string, patch: Partial<LibraryBook>): Promise<LibraryBook>;
+  deleteLibraryDocument(id: string): Promise<void>;
 };
 
 const KokoroTts = NativeModules.KokoroTts as KokoroTtsModule;
@@ -102,10 +131,8 @@ const VOICES = [
   'Lewis',
 ];
 
-const SAMPLE_TEXT =
-  'Open a PDF or EPUB to start reading. Audio Read will highlight the current sentence as Kokoro reads through the document.';
-const INITIAL_BUFFER_SECONDS = 20;
-const BACKGROUND_BUFFER_SECONDS = 180;
+const INITIAL_BUFFER_SECONDS = 18;
+const BACKGROUND_BUFFER_SECONDS = 240;
 const LIBRARY_PREP_SECONDS = 600;
 const MAX_BUFFER_SENTENCES = 160;
 
@@ -161,16 +188,19 @@ function App() {
   const colors = dark ? darkColors : lightColors;
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const [documentTitle, setDocumentTitle] = useState('Sample');
-  const [documentKind, setDocumentKind] = useState<'pdf' | 'epub' | 'text' | 'sample'>('sample');
-  const [sentences, setSentences] = useState<Sentence[]>(() => splitSentences(SAMPLE_TEXT));
+  const [library, setLibrary] = useState<LibraryBook[]>([]);
+  const [view, setView] = useState<'library' | 'reader'>('library');
+  const [activeBookId, setActiveBookId] = useState<string | null>(null);
+  const [documentTitle, setDocumentTitle] = useState('');
+  const [documentKind, setDocumentKind] = useState<'pdf' | 'epub' | 'text'>('text');
+  const [sentences, setSentences] = useState<Sentence[]>([]);
   const [current, setCurrent] = useState(0);
   const [speakerId, setSpeakerId] = useState(2);
-  const [speed, setSpeed] = useState(1);
+  const [speed, setSpeed] = useState(0.95);
   const [ready, setReady] = useState<InitResult | null>(null);
   const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState('Open a PDF or EPUB to begin');
+  const [status, setStatus] = useState('Library ready');
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
   const playTokenRef = useRef(0);
@@ -215,8 +245,19 @@ function App() {
     }, 80);
   }
 
+  const refreshLibrary = async () => {
+    try {
+      const items = await DocumentReader.listLibrary();
+      setLibrary(items);
+      recordLog(`ui library loaded count=${items.length}`);
+    } catch (error) {
+      recordLog(`ui library load failed ${describeError(error)}`);
+    }
+  };
+
   useEffect(() => {
     recordLog('reader app mounted');
+    void Promise.resolve().then(refreshLibrary);
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       void PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(error => {
         recordLog(`notification permission request failed ${describeError(error)}`);
@@ -314,21 +355,35 @@ function App() {
       });
   };
 
-  const startDocumentPreparation = (parsed: Sentence[], title: string) => {
-    const texts = parsed.slice(0, MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
+  const updateBookInState = (book: LibraryBook) => {
+    setLibrary(items => [book, ...items.filter(item => item.id !== book.id)]);
+  };
+
+  const startDocumentPreparation = (parsed: Sentence[], book: LibraryBook, startIndex = 0) => {
+    const texts = parsed.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
     if (!texts.length || backgroundBufferingRef.current) return;
     backgroundBufferingRef.current = true;
-    recordLog(`ui library prepare started title=${title} sentences=${texts.length}`);
+    void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'preparing'}).then(updateBookInState).catch(() => {});
+    recordLog(`ui library prepare started title=${book.title} start=${startIndex} sentences=${texts.length}`);
     void ensureReady()
-      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${title}`))
+      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${book.title}`))
       .then(result => {
         if (!result) return;
         recordLog(
-          `ui library prepare done title=${title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
+          `ui library prepare done title=${book.title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
         );
-        return KokoroTts.notifyPreparationDone(title, result.audioDurationSeconds);
+        void DocumentReader.updateLibraryDocument(book.id, {
+          cacheStatus: 'ready',
+          preparedAudioSeconds: result.audioDurationSeconds,
+        })
+          .then(updateBookInState)
+          .catch(error => recordLog(`ui library prepare metadata update failed ${describeError(error)}`));
+        return KokoroTts.notifyPreparationDone(book.title, result.audioDurationSeconds);
       })
-      .catch(error => recordLog(`ui library prepare failed ${describeError(error)}`))
+      .catch(error => {
+        void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'failed'}).then(updateBookInState).catch(() => {});
+        recordLog(`ui library prepare failed ${describeError(error)}`);
+      })
       .finally(() => {
         backgroundBufferingRef.current = false;
       });
@@ -347,15 +402,25 @@ function App() {
       await KokoroTts.stopPlaybackSession();
       clearWordProgress();
       backgroundBufferingRef.current = false;
+      const book = await DocumentReader.saveLibraryDocument(
+        doc.title,
+        doc.kind,
+        doc.uri,
+        doc.text,
+        parsed.length,
+      );
+      updateBookInState(book);
       setPlaying(false);
+      setActiveBookId(book.id);
       setDocumentTitle(doc.title);
       setDocumentKind(doc.kind);
       setSentences(parsed);
       setCurrent(0);
       setLastResult(null);
-      setStatus(`${doc.kind.toUpperCase()} loaded: ${parsed.length} sentences · preparing audio`);
+      setView('reader');
+      setStatus(`${doc.kind.toUpperCase()} added: ${parsed.length} sentences · caching in background`);
       recordLog(`ui document loaded title=${doc.title} kind=${doc.kind} sentences=${parsed.length}`);
-      startDocumentPreparation(parsed, doc.title);
+      startDocumentPreparation(parsed, book, 0);
     } catch (error) {
       const message = describeError(error);
       if (message.includes('DOCUMENT_PICK_CANCELLED')) {
@@ -367,6 +432,60 @@ function App() {
       recordLog(`ui open document failed ${message}`);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const openLibraryBook = async (book: LibraryBook) => {
+    try {
+      recordLog(`ui library book pressed id=${book.id}`);
+      setBusy(true);
+      setStatus('Opening book...');
+      const loaded = await DocumentReader.loadLibraryDocument(book.id);
+      const parsed = splitSentences(loaded.text);
+      if (!parsed.length) throw new Error('No readable sentences found in this book');
+      playTokenRef.current++;
+      await KokoroTts.stop();
+      await KokoroTts.stopPlaybackSession();
+      clearWordProgress();
+      backgroundBufferingRef.current = false;
+      setPlaying(false);
+      setActiveBookId(loaded.id);
+      setDocumentTitle(loaded.title);
+      setDocumentKind(loaded.kind);
+      setSentences(parsed);
+      const startIndex = Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0));
+      setCurrent(startIndex);
+      setLastResult(null);
+      setView('reader');
+      setStatus(`Ready · ${loaded.cacheStatus === 'ready' ? 'cached audio available' : 'caching continues in background'}`);
+      startDocumentPreparation(parsed, loaded, startIndex);
+    } catch (error) {
+      Alert.alert('Could not open book', describeError(error));
+      setStatus('Book open failed');
+      recordLog(`ui open library book failed ${describeError(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteBook = async (book: LibraryBook) => {
+    try {
+      await DocumentReader.deleteLibraryDocument(book.id);
+      setLibrary(items => items.filter(item => item.id !== book.id));
+      if (activeBookId === book.id) {
+        playTokenRef.current++;
+        await KokoroTts.stop();
+        await KokoroTts.stopPlaybackSession();
+        clearWordProgress();
+        setActiveBookId(null);
+        setSentences([]);
+        setCurrent(0);
+        setPlaying(false);
+        setView('library');
+      }
+      setStatus('Book removed');
+    } catch (error) {
+      Alert.alert('Could not remove book', describeError(error));
     }
   };
 
@@ -389,6 +508,11 @@ function App() {
         if (token !== playTokenRef.current) return;
         const sentence = sentences[index];
         setCurrent(index);
+        if (activeBookId) {
+          void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: index})
+            .then(updateBookInState)
+            .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
+        }
         setActiveWordCount(0);
         setStatus(`Reading ${index + 1} of ${sentences.length}`);
         recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
@@ -447,6 +571,11 @@ function App() {
     clearWordProgress();
     backgroundBufferingRef.current = false;
     setCurrent(bounded);
+    if (activeBookId) {
+      void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: bounded})
+        .then(updateBookInState)
+        .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
+    }
     setPlaying(false);
     setBusy(false);
     if (shouldResume) {
@@ -486,6 +615,50 @@ function App() {
     </Pressable>
   );
 
+  const bookProgress = (book: LibraryBook) =>
+    book.sentenceCount > 0
+      ? Math.max(0, Math.min(100, Math.round(((book.lastPosition + 1) / book.sentenceCount) * 100)))
+      : 0;
+
+  const renderBookItem = ({item}: {item: LibraryBook}) => {
+    const cached = item.cacheStatus === 'ready';
+    return (
+      <Pressable style={styles.bookRow} onPress={() => openLibraryBook(item)}>
+        <View style={styles.bookCover}>
+          <Text style={styles.bookCoverText}>{item.kind.toUpperCase()}</Text>
+        </View>
+        <View style={styles.bookInfo}>
+          <Text style={styles.bookTitle} numberOfLines={2}>
+            {item.title}
+          </Text>
+          <Text style={styles.bookMeta} numberOfLines={1}>
+            {item.sentenceCount} sentences · {bookProgress(item)}% read
+          </Text>
+          <View style={styles.bookProgressTrack}>
+            <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
+          </View>
+          <Text style={[styles.cachePill, cached && styles.cachePillReady]} numberOfLines={1}>
+            {cached
+              ? `${formatDuration(item.preparedAudioSeconds)} cached`
+              : item.cacheStatus === 'preparing'
+                ? 'Caching in background'
+                : 'Cache pending'}
+          </Text>
+        </View>
+        <Pressable
+          style={styles.deleteButton}
+          onPress={event => {
+            event.stopPropagation();
+            void deleteBook(item);
+          }}
+          disabled={busy || playing}
+          hitSlop={10}>
+          <Text style={styles.deleteButtonText}>×</Text>
+        </Pressable>
+      </Pressable>
+    );
+  };
+
   const handleScrollToIndexFailed = (info: {
     index: number;
     highestMeasuredFrameIndex: number;
@@ -517,21 +690,65 @@ function App() {
     timingHandlerRef.current = startWordProgress;
   });
 
+  if (view === 'library') {
+    return (
+      <SafeAreaView style={styles.screen}>
+        <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
+        <View style={styles.libraryHeader}>
+          <View>
+            <Text style={styles.title}>Audio Read</Text>
+            <Text style={styles.subtitle}>Library</Text>
+          </View>
+          <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
+            <Text style={styles.openButtonText}>Import</Text>
+          </Pressable>
+        </View>
+
+        <FlatList
+          data={library}
+          keyExtractor={item => item.id}
+          renderItem={renderBookItem}
+          contentContainerStyle={styles.libraryContent}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>No books yet</Text>
+              <Text style={styles.emptyText}>Import a PDF, EPUB, or TXT file to add it to your library.</Text>
+              <Pressable style={styles.emptyButton} onPress={openDocument} disabled={busy}>
+                <Text style={styles.openButtonText}>Import document</Text>
+              </Pressable>
+            </View>
+          }
+        />
+
+        <View style={styles.libraryFooter}>
+          <Text style={styles.status} numberOfLines={2}>
+            {status}
+          </Text>
+          <Pressable style={styles.logButtonWide} onPress={exportLogs}>
+            <Text style={styles.logButtonText}>Export Logs</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.screen}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
       <View style={styles.header}>
-        <View style={styles.logo}>
-          <Text style={styles.logoText}>AR</Text>
-        </View>
+        <Pressable style={styles.backButton} onPress={() => setView('library')} disabled={busy && !playing}>
+          <Text style={styles.backButtonText}>‹</Text>
+        </Pressable>
         <View style={styles.headerText}>
-          <Text style={styles.title}>Audio Read</Text>
+          <Text style={styles.readerTitle} numberOfLines={1}>
+            {documentTitle || 'Reader'}
+          </Text>
           <Text style={styles.subtitle} numberOfLines={1}>
-            {documentTitle} · {documentKind.toUpperCase()}
+            {documentKind.toUpperCase()} · {sentences.length} sentences
           </Text>
         </View>
         <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
-          <Text style={styles.openButtonText}>Open</Text>
+          <Text style={styles.openButtonText}>Import</Text>
         </Pressable>
       </View>
 
@@ -622,28 +839,28 @@ function App() {
 }
 
 const lightColors = {
-  bg: '#f5f3ee',
-  surface: '#fffdf8',
-  surface2: '#ebe7df',
-  text: '#202124',
-  muted: '#6f6b63',
-  border: '#ddd6c8',
-  accent: '#155e75',
-  accent2: '#d97706',
+  bg: '#f6f7f4',
+  surface: '#ffffff',
+  surface2: '#e8ece7',
+  text: '#1d2423',
+  muted: '#69726f',
+  border: '#d8ded8',
+  accent: '#0f766e',
+  accent2: '#b45309',
   accentText: '#ffffff',
-  highlight: '#fff2bf',
+  highlight: '#fef3c7',
 };
 
 const darkColors = {
-  bg: '#101413',
-  surface: '#171c1b',
-  surface2: '#26302e',
-  text: '#f4f1ea',
-  muted: '#aaa49a',
+  bg: '#101312',
+  surface: '#181d1b',
+  surface2: '#27302d',
+  text: '#f4f6f2',
+  muted: '#a7b0ac',
   border: '#303936',
-  accent: '#22d3ee',
+  accent: '#2dd4bf',
   accent2: '#f59e0b',
-  accentText: '#062426',
+  accentText: '#06211e',
   highlight: '#4a3d18',
 };
 
@@ -660,6 +877,17 @@ function makeStyles(colors: typeof lightColors) {
       paddingHorizontal: 18,
       paddingTop: 12,
       paddingBottom: 12,
+      backgroundColor: colors.surface,
+      borderBottomColor: colors.border,
+      borderBottomWidth: 1,
+    },
+    libraryHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 18,
+      paddingTop: 16,
+      paddingBottom: 14,
       backgroundColor: colors.surface,
       borderBottomColor: colors.border,
       borderBottomWidth: 1,
@@ -683,6 +911,11 @@ function makeStyles(colors: typeof lightColors) {
     title: {
       color: colors.text,
       fontSize: 22,
+      fontWeight: '800',
+    },
+    readerTitle: {
+      color: colors.text,
+      fontSize: 18,
       fontWeight: '800',
     },
     subtitle: {
@@ -711,6 +944,132 @@ function makeStyles(colors: typeof lightColors) {
       height: 4,
       backgroundColor: colors.accent2,
     },
+    libraryContent: {
+      padding: 14,
+      paddingBottom: 110,
+      gap: 10,
+    },
+    bookRow: {
+      flexDirection: 'row',
+      gap: 12,
+      minHeight: 116,
+      borderRadius: 8,
+      borderColor: colors.border,
+      borderWidth: 1,
+      backgroundColor: colors.surface,
+      padding: 12,
+    },
+    bookCover: {
+      width: 72,
+      borderRadius: 6,
+      backgroundColor: colors.surface2,
+      borderColor: colors.border,
+      borderWidth: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    bookCoverText: {
+      color: colors.accent,
+      fontSize: 12,
+      fontWeight: '900',
+    },
+    bookInfo: {
+      flex: 1,
+      minWidth: 0,
+      justifyContent: 'center',
+      gap: 6,
+    },
+    bookTitle: {
+      color: colors.text,
+      fontSize: 17,
+      lineHeight: 22,
+      fontWeight: '800',
+    },
+    bookMeta: {
+      color: colors.muted,
+      fontSize: 12,
+      fontVariant: ['tabular-nums'],
+    },
+    bookProgressTrack: {
+      height: 5,
+      borderRadius: 3,
+      overflow: 'hidden',
+      backgroundColor: colors.surface2,
+    },
+    bookProgressFill: {
+      height: 5,
+      backgroundColor: colors.accent2,
+    },
+    cachePill: {
+      alignSelf: 'flex-start',
+      maxWidth: '100%',
+      color: colors.muted,
+      borderColor: colors.border,
+      borderWidth: 1,
+      borderRadius: 6,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+      fontSize: 11,
+      fontWeight: '800',
+    },
+    cachePillReady: {
+      color: colors.accent,
+      borderColor: colors.accent,
+    },
+    deleteButton: {
+      width: 34,
+      height: 34,
+      borderRadius: 17,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.surface2,
+    },
+    deleteButtonText: {
+      color: colors.muted,
+      fontSize: 24,
+      lineHeight: 26,
+      fontWeight: '700',
+    },
+    emptyState: {
+      minHeight: 420,
+      justifyContent: 'center',
+      alignItems: 'center',
+      gap: 12,
+      paddingHorizontal: 22,
+    },
+    emptyTitle: {
+      color: colors.text,
+      fontSize: 24,
+      fontWeight: '900',
+      textAlign: 'center',
+    },
+    emptyText: {
+      color: colors.muted,
+      fontSize: 15,
+      lineHeight: 22,
+      textAlign: 'center',
+    },
+    emptyButton: {
+      marginTop: 6,
+      minHeight: 46,
+      borderRadius: 8,
+      paddingHorizontal: 18,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.accent,
+    },
+    libraryFooter: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      bottom: 0,
+      padding: 14,
+      paddingBottom: 18,
+      backgroundColor: colors.surface,
+      borderTopColor: colors.border,
+      borderTopWidth: 1,
+      gap: 10,
+    },
     readerContent: {
       padding: 22,
       paddingBottom: 260,
@@ -728,6 +1087,19 @@ function makeStyles(colors: typeof lightColors) {
       backgroundColor: colors.highlight,
       color: colors.text,
       fontWeight: '700',
+    },
+    backButton: {
+      width: 42,
+      height: 42,
+      borderRadius: 21,
+      backgroundColor: colors.surface2,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    backButtonText: {
+      color: colors.text,
+      fontSize: 32,
+      lineHeight: 36,
     },
     spokenWord: {
       color: colors.accent,
@@ -825,6 +1197,15 @@ function makeStyles(colors: typeof lightColors) {
     },
     logButton: {
       width: 64,
+      borderColor: colors.border,
+      borderWidth: 1,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.bg,
+    },
+    logButtonWide: {
+      minHeight: 42,
       borderColor: colors.border,
       borderWidth: 1,
       borderRadius: 8,

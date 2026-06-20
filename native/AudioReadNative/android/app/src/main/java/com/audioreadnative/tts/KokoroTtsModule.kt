@@ -30,9 +30,14 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.getOfflineTtsConfig
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -41,6 +46,7 @@ import kotlin.math.max
 private const val TAG = "AudioReadKokoro"
 private const val MODEL_DIR = "kokoro-en-v0_19"
 private const val MAX_CACHED_AUDIO_SECONDS = 1_200.0
+private const val MAX_DISK_CACHED_AUDIO_SECONDS = 7_200.0
 private const val PREP_CHANNEL_ID = "audio_read_preparation"
 private const val PREP_NOTIFICATION_ID = 1307
 
@@ -202,10 +208,21 @@ class KokoroTtsModule(
             emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
             continue
           }
+          val disk = loadDiskAudio(key)
+          if (disk != null) {
+            synchronized(audioCache) {
+              putAudioCacheLocked(key, disk.copy(source = "disk-prebuffer"))
+            }
+            cacheHits += 1
+            generatedAudioSeconds += disk.audioDurationSeconds
+            emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+            continue
+          }
           val generated = generateAudio(text, speakerId, speed, source = "prebuffer")
           synchronized(audioCache) {
             putAudioCacheLocked(key, generated)
           }
+          saveDiskAudio(key, generated)
           generatedCount += 1
           generatedAudioSeconds += generated.audioDurationSeconds
           LogStore.write(
@@ -355,6 +372,13 @@ class KokoroTtsModule(
         return it.copy(source = "cache")
       }
     }
+    loadDiskAudio(key)?.let {
+      LogStore.write(TAG, "speak disk cache hit chars=${text.length}")
+      synchronized(audioCache) {
+        putAudioCacheLocked(key, it)
+      }
+      return it.copy(source = "disk")
+    }
     val future = synchronized(audioCache) {
       inFlightAudio[key] ?: synthExecutor.submit<GeneratedAudio> {
         generateAudio(text, speakerId, speed, source = "fresh")
@@ -366,6 +390,7 @@ class KokoroTtsModule(
       audioCache.remove(key)
       cachedAudioSeconds = audioCache.values.sumOf { it.audioDurationSeconds }
     }
+    saveDiskAudio(key, generated)
     return generated.copy(source = if (generated.source == "prefetch") "in-flight" else generated.source)
   }
 
@@ -375,6 +400,11 @@ class KokoroTtsModule(
     val key = audioKey(cleanNext, speakerId, speed)
     val future = synchronized(audioCache) {
       if (audioCache.containsKey(key) || inFlightAudio.containsKey(key)) return
+      loadDiskAudio(key)?.let { disk ->
+        putAudioCacheLocked(key, disk.copy(source = "disk-prefetch"))
+        LogStore.write(TAG, "prefetch disk cache hit chars=${cleanNext.length}")
+        return
+      }
       synthExecutor.submit<GeneratedAudio> {
         LogStore.write(TAG, "prefetch generating chars=${cleanNext.length}")
         generateAudio(cleanNext, speakerId, speed, source = "prefetch")
@@ -387,6 +417,7 @@ class KokoroTtsModule(
           inFlightAudio.remove(key)
           putAudioCacheLocked(key, generated)
         }
+        saveDiskAudio(key, generated)
         LogStore.write(
           TAG,
           "prefetch resolved generation=${"%.3f".format(generated.generationSeconds)}s audio=${"%.3f".format(generated.audioDurationSeconds)}s rtf=${"%.3f".format(generated.rtf)} samples=${generated.samples.size}",
@@ -405,7 +436,7 @@ class KokoroTtsModule(
       config = GenerationConfig(
         sid = max(0, speakerId),
         speed = speed.toFloat().coerceIn(0.5f, 2.0f),
-        silenceScale = 0.2f,
+        silenceScale = 0.32f,
       ),
     )
     val generationSeconds = (System.nanoTime() - start) / 1_000_000_000.0
@@ -505,6 +536,87 @@ class KokoroTtsModule(
       val removed = audioCache.remove(eldestKey)
       if (removed != null) cachedAudioSeconds -= removed.audioDurationSeconds
     }
+  }
+
+  private fun diskCacheDir(): File = File(reactContext.filesDir, "audio-cache").also { it.mkdirs() }
+
+  private fun diskCacheFile(key: String): File = File(diskCacheDir(), "${sha256(key)}.pcm")
+
+  private fun loadDiskAudio(key: String): GeneratedAudio? {
+    val file = diskCacheFile(key)
+    if (!file.exists() || file.length() <= 0L) return null
+    return try {
+      DataInputStream(BufferedInputStream(file.inputStream())).use { input ->
+        val version = input.readInt()
+        if (version != 1) return null
+        val sampleRate = input.readInt()
+        val audioDurationSeconds = input.readDouble()
+        val sampleCount = input.readInt()
+        if (sampleCount <= 0) return null
+        val samples = FloatArray(sampleCount)
+        for (index in 0 until sampleCount) {
+          samples[index] = input.readFloat()
+        }
+        file.setLastModified(System.currentTimeMillis())
+        GeneratedAudio(
+          samples = samples,
+          sampleRate = sampleRate,
+          generationSeconds = 0.0,
+          audioDurationSeconds = audioDurationSeconds,
+          rtf = 0.0,
+          source = "disk",
+        )
+      }
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "disk cache read failed ${file.name}: ${e.message}")
+      file.delete()
+      null
+    }
+  }
+
+  private fun saveDiskAudio(key: String, audio: GeneratedAudio) {
+    try {
+      val file = diskCacheFile(key)
+      DataOutputStream(BufferedOutputStream(file.outputStream())).use { output ->
+        output.writeInt(1)
+        output.writeInt(audio.sampleRate)
+        output.writeDouble(audio.audioDurationSeconds)
+        output.writeInt(audio.samples.size)
+        audio.samples.forEach { output.writeFloat(it) }
+      }
+      trimDiskCache()
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "disk cache write failed: ${e.message}")
+    }
+  }
+
+  private fun trimDiskCache() {
+    val files = diskCacheDir()
+      .listFiles { file -> file.isFile && file.extension == "pcm" }
+      ?.sortedBy { it.lastModified() }
+      ?: return
+    var totalSeconds = files.sumOf { file -> readDiskAudioDuration(file) ?: 0.0 }
+    for (file in files) {
+      if (totalSeconds <= MAX_DISK_CACHED_AUDIO_SECONDS) break
+      val seconds = readDiskAudioDuration(file) ?: 0.0
+      if (file.delete()) totalSeconds -= seconds
+    }
+  }
+
+  private fun readDiskAudioDuration(file: File): Double? =
+    try {
+      DataInputStream(BufferedInputStream(file.inputStream())).use { input ->
+        val version = input.readInt()
+        input.readInt()
+        if (version == 1) input.readDouble() else null
+      }
+    } catch (_: Throwable) {
+      null
+    }
+
+  private fun sha256(value: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+    return digest.joinToString("") { "%02x".format(it) }
   }
 
   private fun createPreparationChannel() {

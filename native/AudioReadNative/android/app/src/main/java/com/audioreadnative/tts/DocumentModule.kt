@@ -12,19 +12,26 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.ReadableMap
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import java.io.File
 import java.io.ByteArrayOutputStream
 import java.io.StringReader
+import java.util.UUID
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import org.json.JSONArray
+import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 
 private const val DOCUMENT_PICK_REQUEST = 4207
 private const val DOCUMENT_TAG = "AudioReadDocument"
+private const val LIBRARY_DIR = "library"
+private const val LIBRARY_INDEX = "index.json"
 
 class DocumentModule(
   private val reactContext: ReactApplicationContext
@@ -91,6 +98,123 @@ class DocumentModule(
       addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
     }
     activity.startActivityForResult(intent, DOCUMENT_PICK_REQUEST)
+  }
+
+  @ReactMethod
+  fun listLibrary(promise: Promise) {
+    Thread {
+      try {
+        val array = Arguments.createArray()
+        readLibraryIndex()
+          .sortedByDescending { it.optLong("updatedAt", it.optLong("createdAt", 0L)) }
+          .forEach { item -> array.pushMap(item.toWritableMap()) }
+        promise.resolve(array)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "listLibrary failed: ${e.stackTraceToString()}")
+        promise.reject("LIBRARY_LIST_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun saveLibraryDocument(
+    title: String,
+    kind: String,
+    uri: String,
+    text: String,
+    sentenceCount: Int,
+    promise: Promise,
+  ) {
+    Thread {
+      try {
+        val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        libraryRoot().mkdirs()
+        File(libraryRoot(), "$id.txt").writeText(text)
+        val item = JSONObject().apply {
+          put("id", id)
+          put("title", title)
+          put("kind", kind)
+          put("uri", uri)
+          put("sentenceCount", sentenceCount)
+          put("charCount", text.length)
+          put("createdAt", now)
+          put("updatedAt", now)
+          put("lastPosition", 0)
+          put("preparedAudioSeconds", 0.0)
+          put("cacheStatus", "queued")
+        }
+        val items = readLibraryIndex().filter { it.optString("uri") != uri }.toMutableList()
+        items.add(item)
+        writeLibraryIndex(items)
+        LogStore.write(DOCUMENT_TAG, "library saved id=$id title=$title sentences=$sentenceCount")
+        promise.resolve(item.toWritableMap())
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "saveLibraryDocument failed: ${e.stackTraceToString()}")
+        promise.reject("LIBRARY_SAVE_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun loadLibraryDocument(id: String, promise: Promise) {
+    Thread {
+      try {
+        val item = readLibraryIndex().firstOrNull { it.optString("id") == id }
+          ?: throw IllegalArgumentException("Book not found in library")
+        val textFile = File(libraryRoot(), "$id.txt")
+        if (!textFile.exists()) throw IllegalArgumentException("Book text is missing from storage")
+        val result = item.toWritableMap()
+        result.putString("text", textFile.readText())
+        promise.resolve(result)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "loadLibraryDocument failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("LIBRARY_LOAD_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun updateLibraryDocument(id: String, patch: ReadableMap, promise: Promise) {
+    Thread {
+      try {
+        val items = readLibraryIndex().toMutableList()
+        val index = items.indexOfFirst { it.optString("id") == id }
+        if (index < 0) throw IllegalArgumentException("Book not found in library")
+        val item = items[index]
+        patch.toHashMap().forEach { (key, value) ->
+          when (value) {
+            null -> item.put(key, JSONObject.NULL)
+            is Number -> item.put(key, value)
+            is Boolean -> item.put(key, value)
+            else -> item.put(key, value.toString())
+          }
+        }
+        item.put("updatedAt", System.currentTimeMillis())
+        items[index] = item
+        writeLibraryIndex(items)
+        promise.resolve(item.toWritableMap())
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "updateLibraryDocument failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("LIBRARY_UPDATE_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun deleteLibraryDocument(id: String, promise: Promise) {
+    Thread {
+      try {
+        val items = readLibraryIndex().filterNot { it.optString("id") == id }
+        writeLibraryIndex(items)
+        File(libraryRoot(), "$id.txt").delete()
+        LogStore.write(DOCUMENT_TAG, "library deleted id=$id")
+        promise.resolve(null)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "deleteLibraryDocument failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("LIBRARY_DELETE_FAILED", e.message, e)
+      }
+    }.start()
   }
 
   private fun extract(uri: Uri) = when (val name = displayName(uri)) {
@@ -252,12 +376,44 @@ class DocumentModule(
     }
     return uri.lastPathSegment
   }
+
+  private fun libraryRoot(): File = File(reactContext.filesDir, LIBRARY_DIR)
+
+  private fun libraryIndexFile(): File = File(libraryRoot(), LIBRARY_INDEX)
+
+  private fun readLibraryIndex(): List<JSONObject> {
+    val file = libraryIndexFile()
+    if (!file.exists()) return emptyList()
+    val array = JSONArray(file.readText())
+    return (0 until array.length()).map { array.getJSONObject(it) }
+  }
+
+  private fun writeLibraryIndex(items: List<JSONObject>) {
+    libraryRoot().mkdirs()
+    val array = JSONArray()
+    items.forEach { array.put(it) }
+    libraryIndexFile().writeText(array.toString())
+  }
 }
 
 private data class EpubOpf(
   val manifest: Map<String, String>,
   val spine: List<String>,
 )
+
+private fun JSONObject.toWritableMap() = Arguments.createMap().also { map ->
+  keys().forEach { key ->
+    when (val value = opt(key)) {
+      null, JSONObject.NULL -> map.putNull(key)
+      is Int -> map.putInt(key, value)
+      is Long -> map.putDouble(key, value.toDouble())
+      is Double -> map.putDouble(key, value)
+      is Float -> map.putDouble(key, value.toDouble())
+      is Boolean -> map.putBoolean(key, value)
+      else -> map.putString(key, value.toString())
+    }
+  }
+}
 
 private fun android.content.ContentResolver.takePersistableUriPermissionSafe(uri: Uri, flags: Int) {
   try {
