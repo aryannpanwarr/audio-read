@@ -16,8 +16,12 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.ByteArrayOutputStream
+import java.io.StringReader
 import java.util.Locale
+import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 
 private const val DOCUMENT_PICK_REQUEST = 4207
 private const val DOCUMENT_TAG = "AudioReadDocument"
@@ -129,27 +133,108 @@ class DocumentModule(
   }
 
   private fun extractEpub(uri: Uri): String {
+    val entries = readEpubEntries(uri)
+    val orderedHtmlPaths = epubReadingOrder(entries)
+    val htmlPaths = orderedHtmlPaths.ifEmpty {
+      entries.keys
+        .filter { it.isHtmlPath() }
+        .sorted()
+        .also { LogStore.write(DOCUMENT_TAG, "epub spine unavailable; using sorted html fallback count=${it.size}") }
+    }
     val out = StringBuilder()
+    htmlPaths.forEach { path ->
+      val bytes = entries[path] ?: return@forEach
+      out.append('\n')
+      out.append(bytes.toString(Charsets.UTF_8).htmlToText())
+      out.append('\n')
+    }
+    LogStore.write(DOCUMENT_TAG, "epub extracted htmlFiles=${htmlPaths.size}")
+    return out.toString()
+  }
+
+  private fun readEpubEntries(uri: Uri): Map<String, ByteArray> {
+    val entries = linkedMapOf<String, ByteArray>()
     reactContext.contentResolver.openInputStream(uri).use { input ->
       if (input == null) throw IllegalArgumentException("Could not open EPUB")
       ZipInputStream(input).use { zip ->
         var entry = zip.nextEntry
         while (entry != null) {
-          val name = entry.name.lowercase(Locale.US)
-          if (!entry.isDirectory && (name.endsWith(".xhtml") || name.endsWith(".html") || name.endsWith(".htm"))) {
-            val bytes = ByteArrayOutputStream()
-            zip.copyTo(bytes)
-            out.append('\n')
-            out.append(bytes.toString(Charsets.UTF_8.name()).htmlToText())
-            out.append('\n')
+          if (!entry.isDirectory && entry.isUsefulEpubEntry()) {
+            ByteArrayOutputStream().use { bytes ->
+              zip.copyTo(bytes)
+              entries[entry.name] = bytes.toByteArray()
+            }
           }
           zip.closeEntry()
           entry = zip.nextEntry
         }
       }
     }
-    return out.toString()
+    return entries
   }
+
+  private fun epubReadingOrder(entries: Map<String, ByteArray>): List<String> {
+    return try {
+      val container = entries["META-INF/container.xml"]?.toString(Charsets.UTF_8)
+        ?: entries.entries.firstOrNull { it.key.equals("META-INF/container.xml", ignoreCase = true) }
+          ?.value
+          ?.toString(Charsets.UTF_8)
+        ?: return emptyList()
+      val opfPath = parseContainerOpfPath(container) ?: return emptyList()
+      val opf = entries[opfPath]?.toString(Charsets.UTF_8) ?: return emptyList()
+      val parsed = parseOpf(opf)
+      val basePath = opfPath.substringBeforeLast('/', "")
+      parsed.spine
+        .mapNotNull { idRef -> parsed.manifest[idRef] }
+        .map { href -> joinEpubPath(basePath, href) }
+        .filter { path -> entries[path] != null && path.isHtmlPath() }
+        .also { LogStore.write(DOCUMENT_TAG, "epub spine resolved count=${it.size}") }
+    } catch (e: Throwable) {
+      LogStore.write(DOCUMENT_TAG, "epub spine parse failed: ${e.message}")
+      emptyList()
+    }
+  }
+
+  private fun parseContainerOpfPath(xml: String): String? {
+    val parser = newXmlParser(xml)
+    while (parser.eventType != XmlPullParser.END_DOCUMENT) {
+      if (parser.eventType == XmlPullParser.START_TAG && parser.name == "rootfile") {
+        return parser.getAttributeValue(null, "full-path")
+      }
+      parser.next()
+    }
+    return null
+  }
+
+  private fun parseOpf(xml: String): EpubOpf {
+    val manifest = linkedMapOf<String, String>()
+    val spine = mutableListOf<String>()
+    val parser = newXmlParser(xml)
+    while (parser.eventType != XmlPullParser.END_DOCUMENT) {
+      if (parser.eventType == XmlPullParser.START_TAG) {
+        when (parser.name) {
+          "item" -> {
+            val id = parser.getAttributeValue(null, "id")
+            val href = parser.getAttributeValue(null, "href")
+            if (!id.isNullOrBlank() && !href.isNullOrBlank()) manifest[id] = href
+          }
+          "itemref" -> {
+            val idRef = parser.getAttributeValue(null, "idref")
+            if (!idRef.isNullOrBlank()) spine.add(idRef)
+          }
+        }
+      }
+      parser.next()
+    }
+    return EpubOpf(manifest, spine)
+  }
+
+  private fun newXmlParser(xml: String): XmlPullParser =
+    XmlPullParserFactory.newInstance().newPullParser().apply {
+      setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+      setInput(StringReader(xml))
+      nextTag()
+    }
 
   private fun readText(uri: Uri): String {
     reactContext.contentResolver.openInputStream(uri).use { input ->
@@ -168,6 +253,11 @@ class DocumentModule(
     return uri.lastPathSegment
   }
 }
+
+private data class EpubOpf(
+  val manifest: Map<String, String>,
+  val spine: List<String>,
+)
 
 private fun android.content.ContentResolver.takePersistableUriPermissionSafe(uri: Uri, flags: Int) {
   try {
@@ -194,3 +284,31 @@ private fun String.normalizeDocumentText(): String = this
   .replace(Regex("\\n{3,}"), "\n\n")
   .replace(Regex(" {2,}"), " ")
   .trim()
+
+private fun ZipEntry.isUsefulEpubEntry(): Boolean {
+  val lower = name.lowercase(Locale.US)
+  return lower == "meta-inf/container.xml" ||
+    lower.endsWith(".opf") ||
+    lower.endsWith(".xhtml") ||
+    lower.endsWith(".html") ||
+    lower.endsWith(".htm")
+}
+
+private fun String.isHtmlPath(): Boolean {
+  val lower = lowercase(Locale.US)
+  return lower.endsWith(".xhtml") || lower.endsWith(".html") || lower.endsWith(".htm")
+}
+
+private fun joinEpubPath(basePath: String, href: String): String {
+  val hrefWithoutFragment = href.substringBefore('#')
+  val raw = if (basePath.isBlank()) hrefWithoutFragment else "$basePath/$hrefWithoutFragment"
+  val parts = mutableListOf<String>()
+  raw.split('/').forEach { part ->
+    when (part) {
+      "", "." -> Unit
+      ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.lastIndex)
+      else -> parts.add(part)
+    }
+  }
+  return parts.joinToString("/")
+}
