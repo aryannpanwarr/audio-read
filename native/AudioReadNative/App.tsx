@@ -88,6 +88,7 @@ type KokoroTtsModule = {
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
   notifyPreparationDone(title: string, audioDurationSeconds: number): Promise<void>;
+  requestBackgroundPlaybackPermission(): Promise<boolean>;
   record(message: string): Promise<void>;
   exportLogs(): Promise<string>;
 };
@@ -203,6 +204,7 @@ function App() {
   const [status, setStatus] = useState('Library ready');
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
+  const [cacheStatus, setCacheStatus] = useState('');
   const playTokenRef = useRef(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
@@ -212,6 +214,8 @@ function App() {
   const currentRef = useRef(current);
   const backgroundBufferingRef = useRef(false);
   const visiblePrebufferRef = useRef(false);
+  const preparingBookRef = useRef<LibraryBook | null>(null);
+  const backgroundPermissionPromptedRef = useRef(false);
 
   function clearWordProgress() {
     if (wordTimerRef.current) {
@@ -255,9 +259,21 @@ function App() {
     }
   };
 
+  const requestBackgroundPermission = async () => {
+    if (backgroundPermissionPromptedRef.current || Platform.OS !== 'android') return;
+    backgroundPermissionPromptedRef.current = true;
+    try {
+      const opened = await KokoroTts.requestBackgroundPlaybackPermission();
+      recordLog(`ui background permission prompt opened=${opened}`);
+    } catch (error) {
+      recordLog(`ui background permission prompt failed ${describeError(error)}`);
+    }
+  };
+
   useEffect(() => {
     recordLog('reader app mounted');
     void Promise.resolve().then(refreshLibrary);
+    void Promise.resolve().then(requestBackgroundPermission);
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       void PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(error => {
         recordLog(`notification permission request failed ${describeError(error)}`);
@@ -276,9 +292,20 @@ function App() {
     });
     const prebufferSubscription = emitter.addListener('AudioReadPrebufferProgress', progress => {
       const info = progress as PrebufferProgress;
+      const preparingBook = preparingBookRef.current;
       if (visiblePrebufferRef.current) {
         setStatus(
           `Preparing ${formatDuration(info.audioDurationSeconds)} audio · ${info.processed}/${info.total}`,
+        );
+      } else if (preparingBook) {
+        const cacheText = `${formatDuration(info.audioDurationSeconds)} cached · ${info.processed}/${info.total}`;
+        setCacheStatus(cacheText);
+        setLibrary(items =>
+          items.map(item =>
+            item.id === preparingBook.id
+              ? {...item, cacheStatus: 'preparing', preparedAudioSeconds: info.audioDurationSeconds}
+              : item,
+          ),
         );
       }
       recordLog(
@@ -348,10 +375,16 @@ function App() {
   const startBackgroundBuffer = (startIndex: number) => {
     if (backgroundBufferingRef.current) return;
     backgroundBufferingRef.current = true;
+    if (activeBookId) {
+      preparingBookRef.current = library.find(item => item.id === activeBookId) ?? null;
+    }
     void prebufferFrom(startIndex, BACKGROUND_BUFFER_SECONDS, false)
       .catch(error => recordLog(`ui background prebuffer failed ${describeError(error)}`))
       .finally(() => {
         backgroundBufferingRef.current = false;
+        if (preparingBookRef.current?.id === activeBookId) {
+          preparingBookRef.current = null;
+        }
       });
   };
 
@@ -363,15 +396,22 @@ function App() {
     const texts = parsed.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
     if (!texts.length || backgroundBufferingRef.current) return;
     backgroundBufferingRef.current = true;
+    preparingBookRef.current = book;
+    setCacheStatus(`Caching ${book.title}`);
     void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'preparing'}).then(updateBookInState).catch(() => {});
     recordLog(`ui library prepare started title=${book.title} start=${startIndex} sentences=${texts.length}`);
     void ensureReady()
       .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${book.title}`))
       .then(result => {
         if (!result) return;
+        if (result.audioDurationSeconds < 1 && result.generated === 0 && result.cacheHits === 0) {
+          recordLog(`ui library prepare cancelled title=${book.title}`);
+          return;
+        }
         recordLog(
           `ui library prepare done title=${book.title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
         );
+        setCacheStatus(`${formatDuration(result.audioDurationSeconds)} cached`);
         void DocumentReader.updateLibraryDocument(book.id, {
           cacheStatus: 'ready',
           preparedAudioSeconds: result.audioDurationSeconds,
@@ -386,6 +426,9 @@ function App() {
       })
       .finally(() => {
         backgroundBufferingRef.current = false;
+        if (preparingBookRef.current?.id === book.id) {
+          preparingBookRef.current = null;
+        }
       });
   };
 
@@ -493,8 +536,9 @@ function App() {
     if (!sentences.length) return;
     const token = ++playTokenRef.current;
     setPlaying(true);
-      setBusy(true);
+    setBusy(true);
     try {
+      void requestBackgroundPermission();
       await ensureReady();
       if (backgroundBufferingRef.current) {
         recordLog(`ui foreground play preempting background prebuffer start=${startIndex}`);
@@ -514,7 +558,7 @@ function App() {
             .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
         }
         setActiveWordCount(0);
-        setStatus(`Reading ${index + 1} of ${sentences.length}`);
+        setStatus(`Reading ${index + 1} of ${sentences.length} · caching ahead`);
         recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
         const nextSentence = sentences[index + 1]?.text ?? '';
         const result = await KokoroTts.speak(sentence.text, speakerId, speed, nextSentence);
@@ -773,6 +817,11 @@ function App() {
         <Text style={styles.status} numberOfLines={2}>
           {status}
         </Text>
+        {cacheStatus ? (
+          <Text style={styles.cacheStatus} numberOfLines={1}>
+            {cacheStatus}
+          </Text>
+        ) : null}
 
         <View style={styles.controls}>
           <Pressable
@@ -1122,6 +1171,12 @@ function makeStyles(colors: typeof lightColors) {
       color: colors.text,
       fontSize: 14,
       textAlign: 'center',
+    },
+    cacheStatus: {
+      color: colors.muted,
+      fontSize: 12,
+      textAlign: 'center',
+      fontVariant: ['tabular-nums'],
     },
     controls: {
       flexDirection: 'row',

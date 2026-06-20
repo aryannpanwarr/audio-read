@@ -251,7 +251,10 @@ class DocumentModule(
     reactContext.contentResolver.openInputStream(uri).use { input ->
       if (input == null) throw IllegalArgumentException("Could not open PDF")
       PDDocument.load(input).use { doc ->
-        return PDFTextStripper().getText(doc)
+        return PDFTextStripper().apply {
+          sortByPosition = true
+          addMoreFormatting = true
+        }.getText(doc)
       }
     }
   }
@@ -423,9 +426,11 @@ private fun android.content.ContentResolver.takePersistableUriPermissionSafe(uri
 }
 
 private fun String.htmlToText(): String = this
-  .replace(Regex("(?is)<(script|style).*?</\\1>"), " ")
+  .replace(Regex("(?is)<(script|style|nav|head|metadata).*?</\\1>"), " ")
+  .replace(Regex("(?is)<(h[1-6]|p|div|section|article|li|blockquote|tr)[^>]*>"), "\n")
+  .replace(Regex("(?is)</(h[1-6]|p|div|section|article|li|blockquote|tr)\\s*>"), "\n")
+  .replace(Regex("(?is)<span[^>]*(pagebreak|pagenum)[^>]*>.*?</span>"), " ")
   .replace(Regex("(?is)<br\\s*/?>"), "\n")
-  .replace(Regex("(?is)</p\\s*>"), "\n")
   .replace(Regex("(?is)<[^>]+>"), " ")
   .replace("&nbsp;", " ")
   .replace("&amp;", "&")
@@ -433,13 +438,26 @@ private fun String.htmlToText(): String = this
   .replace("&#39;", "'")
   .replace("&lt;", "<")
   .replace("&gt;", ">")
+  .decodeNumericEntities()
 
 private fun String.normalizeDocumentText(): String = this
   .replace(Regex("[\\t\\x0B\\f\\r]+"), " ")
   .replace(Regex(" *\\n *"), "\n")
+  .replace(Regex("(?m)^\\s*(page\\s*)?\\d{1,4}\\s*$", RegexOption.IGNORE_CASE), "")
   .replace(Regex("\\n{3,}"), "\n\n")
   .replace(Regex(" {2,}"), " ")
   .trim()
+
+private fun String.decodeNumericEntities(): String =
+  replace(Regex("&#(x?[0-9A-Fa-f]+);")) { match ->
+    val raw = match.groupValues[1]
+    val code = if (raw.startsWith("x", ignoreCase = true)) {
+      raw.drop(1).toIntOrNull(16)
+    } else {
+      raw.toIntOrNull()
+    }
+    code?.takeIf { it > 0 }?.let { String(Character.toChars(it)) } ?: match.value
+  }
 
 private fun ZipEntry.isUsefulEpubEntry(): Boolean {
   val lower = name.lowercase(Locale.US)

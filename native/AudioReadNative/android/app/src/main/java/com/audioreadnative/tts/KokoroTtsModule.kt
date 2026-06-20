@@ -12,6 +12,9 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.audioreadnative.AudioReadPlaybackService
 import com.audioreadnative.MainActivity
@@ -40,7 +43,6 @@ import java.io.IOException
 import java.security.MessageDigest
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
@@ -58,6 +60,7 @@ class KokoroTtsModule(
   private val synthExecutor = Executors.newSingleThreadExecutor()
   private var tts: OfflineTts? = null
   private var track: AudioTrack? = null
+  private val generationLock = Any()
   private var cachedAudioSeconds = 0.0
   private val audioCache = object : LinkedHashMap<String, GeneratedAudio>(4, 0.75f, true) {
     override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, GeneratedAudio>?): Boolean {
@@ -66,7 +69,6 @@ class KokoroTtsModule(
       return true
     }
   }
-  private val inFlightAudio = mutableMapOf<String, Future<GeneratedAudio>>()
   private val prebufferEpoch = AtomicInteger(0)
   @Volatile private var stopped = false
   private val commandReceiver = object : BroadcastReceiver() {
@@ -126,7 +128,6 @@ class KokoroTtsModule(
         val audio = getOrGenerateAudio(cleanText, speakerId, speed)
         val audioTrack = ensureAudioTrack(audio.sampleRate)
         val waitSeconds = (System.nanoTime() - callStart) / 1_000_000_000.0
-        startPrefetch(nextText, speakerId, speed)
 
         stopped = false
         audioTrack.pause()
@@ -222,7 +223,10 @@ class KokoroTtsModule(
             emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
             continue
           }
-          val generated = generateAudio(text, speakerId, speed, source = "prebuffer")
+          val generated = synchronized(generationLock) {
+            if (stopped || runEpoch != prebufferEpoch.get()) null
+            else generateAudio(text, speakerId, speed, source = "prebuffer")
+          } ?: break
           synchronized(audioCache) {
             putAudioCacheLocked(key, generated)
           }
@@ -311,6 +315,28 @@ class KokoroTtsModule(
   }
 
   @ReactMethod
+  fun requestBackgroundPlaybackPermission(promise: Promise) {
+    try {
+      val powerManager = reactContext.getSystemService(PowerManager::class.java)
+      if (powerManager.isIgnoringBatteryOptimizations(reactContext.packageName)) {
+        LogStore.write(TAG, "background permission already unrestricted")
+        promise.resolve(false)
+        return
+      }
+      val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+        data = Uri.parse("package:${reactContext.packageName}")
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      reactContext.startActivity(intent)
+      LogStore.write(TAG, "background permission prompt opened")
+      promise.resolve(true)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "background permission prompt failed: ${e.stackTraceToString()}")
+      promise.reject("BACKGROUND_PERMISSION_FAILED", e.message, e)
+    }
+  }
+
+  @ReactMethod
   fun addListener(eventName: String) {
     LogStore.write(TAG, "js listener added event=$eventName")
   }
@@ -383,53 +409,16 @@ class KokoroTtsModule(
       }
       return it.copy(source = "disk")
     }
-    val future = synchronized(audioCache) {
-      inFlightAudio[key] ?: synthExecutor.submit<GeneratedAudio> {
-        generateAudio(text, speakerId, speed, source = "fresh")
-      }.also { inFlightAudio[key] = it }
+    prebufferEpoch.incrementAndGet()
+    val generated = synchronized(generationLock) {
+      generateAudio(text, speakerId, speed, source = "fresh")
     }
-    val generated = future.get()
     synchronized(audioCache) {
-      inFlightAudio.remove(key)
       audioCache.remove(key)
       cachedAudioSeconds = audioCache.values.sumOf { it.audioDurationSeconds }
     }
     saveDiskAudio(key, generated)
-    return generated.copy(source = if (generated.source == "prefetch") "in-flight" else generated.source)
-  }
-
-  private fun startPrefetch(nextText: String?, speakerId: Int, speed: Double) {
-    val cleanNext = nextText?.trim().orEmpty()
-    if (cleanNext.isEmpty()) return
-    val key = audioKey(cleanNext, speakerId, speed)
-    val future = synchronized(audioCache) {
-      if (audioCache.containsKey(key) || inFlightAudio.containsKey(key)) return
-      loadDiskAudio(key)?.let { disk ->
-        putAudioCacheLocked(key, disk.copy(source = "disk-prefetch"))
-        LogStore.write(TAG, "prefetch disk cache hit chars=${cleanNext.length}")
-        return
-      }
-      synthExecutor.submit<GeneratedAudio> {
-        LogStore.write(TAG, "prefetch generating chars=${cleanNext.length}")
-        generateAudio(cleanNext, speakerId, speed, source = "prefetch")
-      }.also { inFlightAudio[key] = it }
-    }
-    synthExecutor.execute {
-      try {
-        val generated = future.get()
-        synchronized(audioCache) {
-          inFlightAudio.remove(key)
-          putAudioCacheLocked(key, generated)
-        }
-        saveDiskAudio(key, generated)
-        LogStore.write(
-          TAG,
-          "prefetch resolved generation=${"%.3f".format(generated.generationSeconds)}s audio=${"%.3f".format(generated.audioDurationSeconds)}s rtf=${"%.3f".format(generated.rtf)} samples=${generated.samples.size}",
-        )
-      } catch (e: Throwable) {
-        LogStore.write(TAG, "prefetch failed: ${e.message}")
-      }
-    }
+    return generated
   }
 
   private fun generateAudio(text: String, speakerId: Int, speed: Double, source: String): GeneratedAudio {
