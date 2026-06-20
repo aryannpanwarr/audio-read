@@ -3,6 +3,8 @@ import {
   Alert,
   LayoutChangeEvent,
   NativeModules,
+  PermissionsAndroid,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -38,6 +40,8 @@ type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
   speak(text: string, speakerId: number, speed: number): Promise<SpeakResult>;
   stop(): Promise<void>;
+  startPlaybackSession(): Promise<void>;
+  stopPlaybackSession(): Promise<void>;
   record(message: string): Promise<void>;
   exportLogs(): Promise<string>;
 };
@@ -134,6 +138,11 @@ function App() {
 
   useEffect(() => {
     recordLog('reader app mounted');
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      void PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(error => {
+        recordLog(`notification permission request failed ${describeError(error)}`);
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -164,6 +173,7 @@ function App() {
       if (!parsed.length) throw new Error('No readable sentences found in this document');
       playTokenRef.current++;
       await KokoroTts.stop();
+      await KokoroTts.stopPlaybackSession();
       setPlaying(false);
       setDocumentTitle(doc.title);
       setDocumentKind(doc.kind);
@@ -194,6 +204,7 @@ function App() {
     setBusy(true);
     try {
       await ensureReady();
+      await KokoroTts.startPlaybackSession();
       for (let index = startIndex; index < sentences.length; index++) {
         if (token !== playTokenRef.current) return;
         const sentence = sentences[index];
@@ -206,10 +217,12 @@ function App() {
       }
       setStatus('Finished');
       setPlaying(false);
+      await KokoroTts.stopPlaybackSession();
     } catch (error) {
       const message = describeError(error);
       setStatus('Playback failed');
       setPlaying(false);
+      await KokoroTts.stopPlaybackSession().catch(() => {});
       Alert.alert('Playback failed', message);
       recordLog(`ui playback failed ${message}`);
     } finally {
@@ -227,6 +240,7 @@ function App() {
       setPlaying(false);
       setBusy(false);
       await KokoroTts.stop();
+      await KokoroTts.stopPlaybackSession();
       setStatus('Paused');
       return;
     }
@@ -239,6 +253,7 @@ function App() {
     recordLog(`ui jump ${current}->${bounded}`);
     playTokenRef.current++;
     await KokoroTts.stop();
+    await KokoroTts.stopPlaybackSession();
     setCurrent(bounded);
     setPlaying(false);
     setBusy(false);

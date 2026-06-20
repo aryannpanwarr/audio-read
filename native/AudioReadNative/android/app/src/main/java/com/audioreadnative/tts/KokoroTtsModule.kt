@@ -5,6 +5,8 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import androidx.core.content.ContextCompat
+import com.audioreadnative.AudioReadPlaybackService
 import androidx.core.content.FileProvider
 import com.audioreadnative.LogStore
 import android.util.Log
@@ -120,6 +122,33 @@ class KokoroTtsModule(
       track?.flush()
       LogStore.write(TAG, "stop resolved")
       promise.resolve(null)
+    }
+  }
+
+  @ReactMethod
+  fun startPlaybackSession(promise: Promise) {
+    try {
+      LogStore.write(TAG, "startPlaybackSession requested")
+      ContextCompat.startForegroundService(
+        reactContext,
+        AudioReadPlaybackService.startIntent(reactContext),
+      )
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "startPlaybackSession failed: ${e.stackTraceToString()}")
+      promise.reject("PLAYBACK_SERVICE_START_FAILED", e.message, e)
+    }
+  }
+
+  @ReactMethod
+  fun stopPlaybackSession(promise: Promise) {
+    try {
+      LogStore.write(TAG, "stopPlaybackSession requested")
+      reactContext.startService(AudioReadPlaybackService.stopIntent(reactContext))
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "stopPlaybackSession failed: ${e.stackTraceToString()}")
+      promise.reject("PLAYBACK_SERVICE_STOP_FAILED", e.message, e)
     }
   }
 
