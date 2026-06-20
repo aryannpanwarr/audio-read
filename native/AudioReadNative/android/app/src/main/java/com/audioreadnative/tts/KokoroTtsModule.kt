@@ -17,6 +17,7 @@ import com.audioreadnative.LogStore
 import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
+import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
@@ -34,6 +35,7 @@ import kotlin.math.max
 
 private const val TAG = "AudioReadKokoro"
 private const val MODEL_DIR = "kokoro-en-v0_19"
+private const val MAX_CACHED_AUDIO_SECONDS = 1_200.0
 
 class KokoroTtsModule(
   private val reactContext: ReactApplicationContext
@@ -42,8 +44,13 @@ class KokoroTtsModule(
   private val synthExecutor = Executors.newSingleThreadExecutor()
   private var tts: OfflineTts? = null
   private var track: AudioTrack? = null
+  private var cachedAudioSeconds = 0.0
   private val audioCache = object : LinkedHashMap<String, GeneratedAudio>(4, 0.75f, true) {
-    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, GeneratedAudio>?): Boolean = size > 3
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, GeneratedAudio>?): Boolean {
+      if (cachedAudioSeconds <= MAX_CACHED_AUDIO_SECONDS) return false
+      eldest?.value?.let { cachedAudioSeconds -= it.audioDurationSeconds }
+      return true
+    }
   }
   private val inFlightAudio = mutableMapOf<String, Future<GeneratedAudio>>()
   @Volatile private var stopped = false
@@ -161,6 +168,65 @@ class KokoroTtsModule(
   }
 
   @ReactMethod
+  fun prebuffer(texts: ReadableArray, speakerId: Int, speed: Double, targetAudioSeconds: Double, promise: Promise) {
+    val items = mutableListOf<String>()
+    for (index in 0 until texts.size()) {
+      texts.getString(index)?.trim()?.takeIf { it.isNotEmpty() }?.let { items.add(it) }
+    }
+    LogStore.write(
+      TAG,
+      "prebuffer requested items=${items.size} targetAudio=${"%.1f".format(targetAudioSeconds)} speakerId=$speakerId speed=$speed",
+    )
+    stopped = false
+    synthExecutor.execute {
+      val startedAt = System.nanoTime()
+      var generatedCount = 0
+      var generatedAudioSeconds = 0.0
+      var cacheHits = 0
+      try {
+        for ((index, text) in items.withIndex()) {
+          if (stopped) break
+          if (generatedAudioSeconds >= targetAudioSeconds) break
+          val key = audioKey(text, speakerId, speed)
+          val cached = synchronized(audioCache) { audioCache[key] }
+          if (cached != null) {
+            cacheHits += 1
+            generatedAudioSeconds += cached.audioDurationSeconds
+            emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+            continue
+          }
+          val generated = generateAudio(text, speakerId, speed, source = "prebuffer")
+          synchronized(audioCache) {
+            putAudioCacheLocked(key, generated)
+          }
+          generatedCount += 1
+          generatedAudioSeconds += generated.audioDurationSeconds
+          LogStore.write(
+            TAG,
+            "prebuffer item=${index + 1}/${items.size} generation=${"%.3f".format(generated.generationSeconds)}s audio=${"%.3f".format(generated.audioDurationSeconds)}s totalAudio=${"%.3f".format(generatedAudioSeconds)}s cacheSeconds=${"%.3f".format(cachedAudioSeconds)}",
+          )
+          emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+        }
+        val elapsed = (System.nanoTime() - startedAt) / 1_000_000_000.0
+        LogStore.write(
+          TAG,
+          "prebuffer resolved generated=$generatedCount cacheHits=$cacheHits audio=${"%.3f".format(generatedAudioSeconds)}s elapsed=${"%.3f".format(elapsed)}s",
+        )
+        val map = Arguments.createMap().apply {
+          putInt("generated", generatedCount)
+          putInt("cacheHits", cacheHits)
+          putDouble("audioDurationSeconds", generatedAudioSeconds)
+          putDouble("elapsedSeconds", elapsed)
+        }
+        promise.resolve(map)
+      } catch (e: Throwable) {
+        LogStore.write(TAG, "prebuffer failed: ${e.stackTraceToString()}")
+        promise.reject("KOKORO_PREBUFFER_FAILED", e.message, e)
+      }
+    }
+  }
+
+  @ReactMethod
   fun startPlaybackSession(promise: Promise) {
     try {
       LogStore.write(TAG, "startPlaybackSession requested")
@@ -262,6 +328,7 @@ class KokoroTtsModule(
     synchronized(audioCache) {
       inFlightAudio.remove(key)
       audioCache.remove(key)
+      cachedAudioSeconds = audioCache.values.sumOf { it.audioDurationSeconds }
     }
     return generated.copy(source = if (generated.source == "prefetch") "in-flight" else generated.source)
   }
@@ -282,7 +349,7 @@ class KokoroTtsModule(
         val generated = future.get()
         synchronized(audioCache) {
           inFlightAudio.remove(key)
-          audioCache[key] = generated
+          putAudioCacheLocked(key, generated)
         }
         LogStore.write(
           TAG,
@@ -334,6 +401,26 @@ class KokoroTtsModule(
       .emit("AudioReadSpeechTiming", map)
   }
 
+  private fun emitPrebufferProgress(
+    processed: Int,
+    total: Int,
+    audioSeconds: Double,
+    startedAt: Long,
+    cacheHits: Int,
+  ) {
+    val elapsed = (System.nanoTime() - startedAt) / 1_000_000_000.0
+    val map = Arguments.createMap().apply {
+      putInt("processed", processed)
+      putInt("total", total)
+      putInt("cacheHits", cacheHits)
+      putDouble("audioDurationSeconds", audioSeconds)
+      putDouble("elapsedSeconds", elapsed)
+    }
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit("AudioReadPrebufferProgress", map)
+  }
+
   @Synchronized
   private fun ensureTts(): OfflineTts {
     tts?.let {
@@ -372,6 +459,17 @@ class KokoroTtsModule(
 
   private fun audioKey(text: String, speakerId: Int, speed: Double): String =
     "${max(0, speakerId)}|${speed.toFloat().coerceIn(0.5f, 2.0f)}|$text"
+
+  private fun putAudioCacheLocked(key: String, audio: GeneratedAudio) {
+    audioCache.remove(key)?.let { cachedAudioSeconds -= it.audioDurationSeconds }
+    audioCache[key] = audio
+    cachedAudioSeconds += audio.audioDurationSeconds
+    while (cachedAudioSeconds > MAX_CACHED_AUDIO_SECONDS && audioCache.isNotEmpty()) {
+      val eldestKey = audioCache.entries.first().key
+      val removed = audioCache.remove(eldestKey)
+      if (removed != null) cachedAudioSeconds -= removed.audioDurationSeconds
+    }
+  }
 
   private fun ensureAudioTrack(sampleRate: Int): AudioTrack {
     track?.let { return it }

@@ -42,9 +42,30 @@ type SpeechTiming = {
   wordCount: number;
 };
 
+type PrebufferProgress = {
+  processed: number;
+  total: number;
+  cacheHits: number;
+  audioDurationSeconds: number;
+  elapsedSeconds: number;
+};
+
+type PrebufferResult = {
+  generated: number;
+  cacheHits: number;
+  audioDurationSeconds: number;
+  elapsedSeconds: number;
+};
+
 type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
   speak(text: string, speakerId: number, speed: number, nextText: string): Promise<SpeakResult>;
+  prebuffer(
+    texts: string[],
+    speakerId: number,
+    speed: number,
+    targetAudioSeconds: number,
+  ): Promise<PrebufferResult>;
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
@@ -82,6 +103,9 @@ const VOICES = [
 
 const SAMPLE_TEXT =
   'Open a PDF or EPUB to start reading. Audio Read will highlight the current sentence as Kokoro reads through the document.';
+const INITIAL_BUFFER_SECONDS = 600;
+const BACKGROUND_BUFFER_SECONDS = 180;
+const MAX_BUFFER_SENTENCES = 160;
 
 const describeError = (error: unknown) => {
   if (error instanceof Error) {
@@ -154,6 +178,8 @@ function App() {
   const wordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
+  const backgroundBufferingRef = useRef(false);
+  const visiblePrebufferRef = useRef(false);
 
   function clearWordProgress() {
     if (wordTimerRef.current) {
@@ -205,9 +231,21 @@ function App() {
     const timingSubscription = emitter.addListener('AudioReadSpeechTiming', timing => {
       timingHandlerRef.current(timing as SpeechTiming);
     });
+    const prebufferSubscription = emitter.addListener('AudioReadPrebufferProgress', progress => {
+      const info = progress as PrebufferProgress;
+      if (visiblePrebufferRef.current) {
+        setStatus(
+          `Preparing ${formatDuration(info.audioDurationSeconds)} audio · ${info.processed}/${info.total}`,
+        );
+      }
+      recordLog(
+        `ui prebuffer progress processed=${info.processed}/${info.total} audio=${info.audioDurationSeconds.toFixed(3)}s elapsed=${info.elapsedSeconds.toFixed(3)}s cacheHits=${info.cacheHits}`,
+      );
+    });
     return () => {
       commandSubscription.remove();
       timingSubscription.remove();
+      prebufferSubscription.remove();
       clearWordProgress();
     };
   }, []);
@@ -238,6 +276,40 @@ function App() {
     return info;
   };
 
+  const sentenceWindow = (startIndex: number) =>
+    sentences.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
+
+  const prebufferFrom = async (startIndex: number, targetSeconds: number, visible: boolean) => {
+    const texts = sentenceWindow(startIndex);
+    if (!texts.length) return null;
+    visiblePrebufferRef.current = visible;
+    try {
+      if (visible) setStatus('Preparing audio buffer...');
+      const result = await KokoroTts.prebuffer(texts, speakerId, speed, targetSeconds);
+      recordLog(
+        `ui prebuffer done start=${startIndex} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
+      );
+      if (visible) {
+        setStatus(`Prepared ${formatDuration(result.audioDurationSeconds)} audio`);
+      }
+      return result;
+    } finally {
+      if (visible) {
+        visiblePrebufferRef.current = false;
+      }
+    }
+  };
+
+  const startBackgroundBuffer = (startIndex: number) => {
+    if (backgroundBufferingRef.current) return;
+    backgroundBufferingRef.current = true;
+    void prebufferFrom(startIndex, BACKGROUND_BUFFER_SECONDS, false)
+      .catch(error => recordLog(`ui background prebuffer failed ${describeError(error)}`))
+      .finally(() => {
+        backgroundBufferingRef.current = false;
+      });
+  };
+
   const openDocument = async () => {
     try {
       recordLog('ui open document pressed');
@@ -250,6 +322,7 @@ function App() {
       await KokoroTts.stop();
       await KokoroTts.stopPlaybackSession();
       clearWordProgress();
+      backgroundBufferingRef.current = false;
       setPlaying(false);
       setDocumentTitle(doc.title);
       setDocumentKind(doc.kind);
@@ -279,7 +352,10 @@ function App() {
     setBusy(true);
     try {
       await ensureReady();
+      await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
+      if (token !== playTokenRef.current) return;
       await KokoroTts.startPlaybackSession();
+      startBackgroundBuffer(startIndex + 1);
       for (let index = startIndex; index < sentences.length; index++) {
         if (token !== playTokenRef.current) return;
         const sentence = sentences[index];
@@ -294,6 +370,7 @@ function App() {
         recordLog(
           `ui sentence done index=${index} generation=${result.elapsedSeconds.toFixed(3)}s audio=${result.audioDurationSeconds.toFixed(3)}s rtf=${result.rtf.toFixed(3)} cached=${Boolean(result.cached)}`,
         );
+        startBackgroundBuffer(index + 2);
       }
       setStatus('Finished');
       setPlaying(false);
@@ -324,6 +401,7 @@ function App() {
       await KokoroTts.stop();
       await KokoroTts.stopPlaybackSession();
       clearWordProgress();
+      backgroundBufferingRef.current = false;
       setStatus('Paused');
       return;
     }
@@ -338,6 +416,7 @@ function App() {
     playTokenRef.current++;
     await KokoroTts.stop();
     clearWordProgress();
+    backgroundBufferingRef.current = false;
     setCurrent(bounded);
     setPlaying(false);
     setBusy(false);
