@@ -3,6 +3,7 @@ import { SPEED_OPTIONS, VOICE_OPTIONS } from '../tts/voices'
 import { hasDeviceTts } from '../tts/deviceTts'
 import { PERF_OPTIONS, type Perf } from '../tts/ttsClient'
 import type { Engine, ModelStatus, Phase } from '../hooks/useReader'
+import { isMobileDevice } from '../lib/platform'
 
 interface Props {
   phase: Phase
@@ -43,6 +44,7 @@ export function Controls({
 }: Props) {
   const playing = phase === 'playing' || phase === 'buffering'
   const canPlay = engine === 'device' || modelStatus === 'ready'
+  const mobile = isMobileDevice()
 
   return (
     <div className="controls">
@@ -59,7 +61,7 @@ export function Controls({
         <label className="control-field">
           <span>Engine</span>
           <select value={engine} onChange={(e) => onEngine(e.target.value as Engine)}>
-            <option value="kokoro">AI (Kokoro)</option>
+            <option value="kokoro">{mobile ? 'AI (slow on phones)' : 'AI (Kokoro)'}</option>
             <option value="device">Device</option>
           </select>
         </label>
@@ -117,6 +119,10 @@ export function Controls({
       <div className="time-display" title="Estimated from reading speed">
         <strong>{formatTime(times.remaining)}</strong> left&nbsp;·&nbsp;≈{formatTime(times.total)} total
       </div>
+
+      {mobile && engine === 'kokoro' && (
+        <div className="mobile-engine-warning">Kokoro may stutter or fail on phones.</div>
+      )}
     </div>
   )
 }

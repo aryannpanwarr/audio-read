@@ -311,3 +311,10 @@ body {
 .time-display strong {
   color: var(--text);
 }
+
+.mobile-engine-warning {
+  flex-basis: 100%;
+  text-align: center;
+  font-size: 0.78rem;
+  color: #9f1239;
+}

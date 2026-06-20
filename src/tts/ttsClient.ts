@@ -1,4 +1,5 @@
 import type { WorkerRequest, WorkerResponse } from '../types'
+import { isMobileDevice } from '../lib/platform'
 
 export interface SynthResult {
   samples: Float32Array
@@ -88,24 +89,24 @@ export class TtsClient {
       // fallback ladder: a failed attempt leaves the worker unusable, so each
       // retry starts a fresh worker. threads:1 covers browsers where
       // multithreaded WASM (SharedArrayBuffer) crashes.
-      const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+      const mobile = isMobileDevice()
       const attempts: { device: 'webgpu' | 'wasm'; threads?: number; dtype?: string }[] =
-        device === 'webgpu'
-          ? mobile
-            ? [
-                // phones: fp16 (half the download and GPU memory), then
-                // straight to WASM — fp32 on a phone GPU tends to OOM and
-                // kill the whole tab, which no fallback can recover from
-                { device: 'webgpu', dtype: 'fp16' },
-                { device: 'wasm' },
-                { device: 'wasm', threads: 1 },
-              ]
-            : [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
-          : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
+        mobile
+          ? [
+              // Phones are usually memory-bound and mobile WebGPU is still
+              // uneven for ONNX. Prefer the smallest WASM model and one
+              // thread; users who want to experiment can still override via
+              // query params or the performance picker.
+              { device: 'wasm', dtype: opts.dtype ?? 'q4', threads: opts.threads ?? 1 },
+              { device: 'wasm', dtype: 'q8', threads: 1 },
+            ]
+          : device === 'webgpu'
+            ? [{ device: 'webgpu' }, { device: 'wasm' }, { device: 'wasm', threads: 1 }]
+            : [{ device: 'wasm' }, { device: 'wasm', threads: 1 }]
       // performance preset: a lite-model attempt goes in front of the ladder,
       // a thread count applies to WASM attempts that don't pin their own
       // (the threads:1 crash-retry keeps its 1)
-      if (opts.dtype) attempts.unshift({ device: 'wasm', dtype: opts.dtype })
+      if (opts.dtype && !mobile) attempts.unshift({ device: 'wasm', dtype: opts.dtype })
       if (opts.threads) {
         for (const a of attempts) if (a.device === 'wasm' && a.threads == null) a.threads = opts.threads
       }

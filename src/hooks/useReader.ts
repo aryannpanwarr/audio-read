@@ -8,6 +8,7 @@ import { TtsClient, CancelledError, perfToOpts, PERF_OPTIONS, type Perf, type Pr
 import { DEFAULT_VOICE } from '../tts/voices'
 import { cancelSpeech, hasDeviceTts, loadDeviceVoices, speak } from '../tts/deviceTts'
 import { Player } from '../audio/player'
+import { isMobileDevice } from '../lib/platform'
 
 export type Phase = 'idle' | 'extracting' | 'ready' | 'playing' | 'paused' | 'buffering'
 export type ModelStatus = 'idle' | 'loading' | 'ready'
@@ -18,9 +19,12 @@ export interface Highlight {
   w: number
 }
 
-const PREFETCH_MIN = 3
-const PREFETCH_MAX = 8
-const CACHE_LIMIT = 24
+const DESKTOP_PREFETCH_MIN = 3
+const DESKTOP_PREFETCH_MAX = 8
+const DESKTOP_CACHE_LIMIT = 24
+const MOBILE_PREFETCH_MIN = 1
+const MOBILE_PREFETCH_MAX = 3
+const MOBILE_CACHE_LIMIT = 8
 
 interface AudioChunk {
   buf: AudioBuffer
@@ -35,13 +39,24 @@ interface SentenceAudio {
 }
 
 function initialEngine(): Engine {
+  const params = new URLSearchParams(location.search)
+  const forced = params.get('engine')
+  if (forced === 'kokoro' || forced === 'device') {
+    return forced === 'device' && !hasDeviceTts() ? 'kokoro' : forced
+  }
+  // phones: native OS voices are instant and need no large model download.
+  // Ignore an older saved Kokoro preference on mobile; the user can still
+  // switch engines explicitly after opening a document.
+  if (isMobileDevice() && hasDeviceTts()) return 'device'
   const saved = localStorage.getItem('audio-read-engine')
   if (saved === 'kokoro' || saved === 'device') {
     return saved === 'device' && !hasDeviceTts() ? 'kokoro' : saved
   }
-  // phones: native OS voices are instant and need no 90MB download
-  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-  return mobile && hasDeviceTts() ? 'device' : 'kokoro'
+  return 'kokoro'
+}
+
+function monotonicNow() {
+  return performance.now()
 }
 
 export function useReader() {
@@ -88,7 +103,15 @@ export function useReader() {
   const playerRef = useRef(new Player())
   const estimatorRef = useRef(new TimeEstimator())
   const progressFilesRef = useRef(new Map<string, ProgressInfo>())
-  const prefetchAheadRef = useRef(PREFETCH_MIN)
+  const mobile = isMobileDevice()
+  const mobileRef = useRef(mobile)
+  const prefetchMin = mobile ? MOBILE_PREFETCH_MIN : DESKTOP_PREFETCH_MIN
+  const prefetchMax = mobile ? MOBILE_PREFETCH_MAX : DESKTOP_PREFETCH_MAX
+  const cacheLimit = mobile ? MOBILE_CACHE_LIMIT : DESKTOP_CACHE_LIMIT
+  const prefetchMinRef = useRef(prefetchMin)
+  const prefetchMaxRef = useRef(prefetchMax)
+  const cacheLimitRef = useRef(cacheLimit)
+  const prefetchAheadRef = useRef(prefetchMin)
   const gapCountRef = useRef(0)
 
   const setPhase = (p: Phase) => {
@@ -171,11 +194,12 @@ export function useReader() {
 
   const evictCache = () => {
     const cache = cacheRef.current
-    if (cache.size <= CACHE_LIMIT) return
+    const limit = cacheLimitRef.current
+    if (cache.size <= limit) return
     const cur = currentRef.current
     const keys = [...cache.keys()].sort((a, b) => Math.abs(b - cur) - Math.abs(a - cur))
     for (const k of keys) {
-      if (cache.size <= CACHE_LIMIT - 4) break
+      if (cache.size <= Math.max(1, limit - 4)) break
       if (k === cur) continue
       cache.delete(k)
     }
@@ -191,11 +215,13 @@ export function useReader() {
   /** Playback outran synthesis: deepen the runway, and after repeated
    * underruns tell the user this device can't keep up in real time. */
   const registerGap = () => {
-    prefetchAheadRef.current = Math.min(PREFETCH_MAX, prefetchAheadRef.current + 2)
+    prefetchAheadRef.current = Math.min(prefetchMaxRef.current, prefetchAheadRef.current + 2)
     gapCountRef.current++
     if (gapCountRef.current === 3 && engineRef.current === 'kokoro') {
       setHint(
-        'Your device generates AI audio slower than it plays. For gap-free listening, switch the Engine to “Device”, or enable WebGPU in your browser (chrome://flags → “Unsafe WebGPU”).',
+        mobileRef.current
+          ? 'Kokoro is too heavy for smooth playback on this phone. Switch the Engine to Device for gap-free listening.'
+          : 'Your device generates AI audio slower than it plays. For gap-free listening, switch the Engine to Device, or enable WebGPU in your browser.',
       )
     }
   }
@@ -242,7 +268,7 @@ export function useReader() {
     const token = ++deviceTokenRef.current
     const voiceObj =
       deviceVoicesRef.current.find((v) => v.voiceURI === deviceVoiceUriRef.current) ?? null
-    const t0 = performance.now()
+    const t0 = monotonicNow()
     speak(s.text, voiceObj, speedRef.current, {
       onBoundary: (charIndex) => {
         if (token !== deviceTokenRef.current) return
@@ -255,7 +281,7 @@ export function useReader() {
       },
       onEnd: () => {
         if (token !== deviceTokenRef.current) return
-        estimatorRef.current.observe(sentenceWeight(s), (performance.now() - t0) / 1000, speedRef.current)
+        estimatorRef.current.observe(sentenceWeight(s), (monotonicNow() - t0) / 1000, speedRef.current)
         startDeviceSentence(i + 1)
       },
       onError: (err) => {
@@ -436,7 +462,7 @@ export function useReader() {
     if (e === engineRef.current) return
     stopAll()
     gapCountRef.current = 0
-    prefetchAheadRef.current = PREFETCH_MIN
+    prefetchAheadRef.current = prefetchMinRef.current
     setHint(null)
     engineRef.current = e
     setEngineState(e)
@@ -493,7 +519,7 @@ export function useReader() {
     setError(null)
     setHint(null)
     gapCountRef.current = 0
-    prefetchAheadRef.current = PREFETCH_MIN
+    prefetchAheadRef.current = prefetchMinRef.current
     setPhase('extracting')
     try {
       const [paragraphs, key] = await Promise.all([extractParagraphs(file), docKey(file)])
