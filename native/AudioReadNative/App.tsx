@@ -493,14 +493,14 @@ function App() {
     if (!sentences.length) return;
     const token = ++playTokenRef.current;
     setPlaying(true);
-    setBusy(true);
+      setBusy(true);
     try {
       await ensureReady();
       if (backgroundBufferingRef.current) {
-        setStatus('Using background preparation...');
-      } else {
-        await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
+        recordLog(`ui foreground play preempting background prebuffer start=${startIndex}`);
+        backgroundBufferingRef.current = false;
       }
+      await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
       if (token !== playTokenRef.current) return;
       await KokoroTts.startPlaybackSession();
       startBackgroundBuffer(startIndex + 1);

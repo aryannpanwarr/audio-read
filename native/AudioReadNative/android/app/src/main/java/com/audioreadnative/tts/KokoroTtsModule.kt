@@ -41,6 +41,7 @@ import java.security.MessageDigest
 import java.util.LinkedHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 private const val TAG = "AudioReadKokoro"
@@ -66,6 +67,7 @@ class KokoroTtsModule(
     }
   }
   private val inFlightAudio = mutableMapOf<String, Future<GeneratedAudio>>()
+  private val prebufferEpoch = AtomicInteger(0)
   @Volatile private var stopped = false
   private val commandReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -169,6 +171,7 @@ class KokoroTtsModule(
   fun stop(promise: Promise) {
     LogStore.write(TAG, "stop requested")
     stopped = true
+    prebufferEpoch.incrementAndGet()
     try {
       track?.pause()
       track?.flush()
@@ -191,6 +194,7 @@ class KokoroTtsModule(
       "prebuffer requested items=${items.size} targetAudio=${"%.1f".format(targetAudioSeconds)} speakerId=$speakerId speed=$speed",
     )
     stopped = false
+    val runEpoch = prebufferEpoch.incrementAndGet()
     synthExecutor.execute {
       val startedAt = System.nanoTime()
       var generatedCount = 0
@@ -198,7 +202,7 @@ class KokoroTtsModule(
       var cacheHits = 0
       try {
         for ((index, text) in items.withIndex()) {
-          if (stopped) break
+          if (stopped || runEpoch != prebufferEpoch.get()) break
           if (generatedAudioSeconds >= targetAudioSeconds) break
           val key = audioKey(text, speakerId, speed)
           val cached = synchronized(audioCache) { audioCache[key] }
