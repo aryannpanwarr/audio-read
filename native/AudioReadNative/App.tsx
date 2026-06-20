@@ -1,14 +1,13 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
-  LayoutChangeEvent,
+  FlatList,
   NativeEventEmitter,
   NativeModules,
   PermissionsAndroid,
   Platform,
   Pressable,
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -148,8 +147,7 @@ function App() {
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
   const playTokenRef = useRef(0);
-  const scrollRef = useRef<ScrollView>(null);
-  const sentenceYRef = useRef<Record<number, number>>({});
+  const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
   const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
   const wordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -219,11 +217,14 @@ function App() {
   }, [sentences, current]);
 
   useEffect(() => {
-    const y = sentenceYRef.current[current];
-    if (typeof y === 'number') {
-      scrollRef.current?.scrollTo({y: Math.max(0, y - 80), animated: true});
+    if (sentences.length) {
+      listRef.current?.scrollToIndex({
+        index: current,
+        animated: true,
+        viewPosition: 0.2,
+      });
     }
-  }, [current]);
+  }, [current, sentences.length]);
 
   const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
 
@@ -251,7 +252,6 @@ function App() {
       setPlaying(false);
       setDocumentTitle(doc.title);
       setDocumentKind(doc.kind);
-      sentenceYRef.current = {};
       setSentences(parsed);
       setCurrent(0);
       setLastResult(null);
@@ -326,17 +326,22 @@ function App() {
     void speakAt(current);
   };
 
-  const jump = async (next: number) => {
+  const skipTo = async (next: number) => {
     const bounded = Math.max(0, Math.min(sentences.length - 1, next));
-    recordLog(`ui jump ${current}->${bounded}`);
+    const shouldResume = playing;
+    recordLog(`ui skip ${current}->${bounded} resume=${shouldResume}`);
     playTokenRef.current++;
     await KokoroTts.stop();
-    await KokoroTts.stopPlaybackSession();
     clearWordProgress();
     setCurrent(bounded);
     setPlaying(false);
     setBusy(false);
-    setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
+    if (shouldResume) {
+      void speakAt(bounded);
+    } else {
+      await KokoroTts.stopPlaybackSession();
+      setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
+    }
   };
 
   const exportLogs = async () => {
@@ -346,10 +351,6 @@ function App() {
     } catch (error) {
       Alert.alert('Could not export logs', describeError(error));
     }
-  };
-
-  const recordSentenceLayout = (id: number, event: LayoutChangeEvent) => {
-    sentenceYRef.current[id] = event.nativeEvent.layout.y;
   };
 
   const renderSentence = (sentence: Sentence) => {
@@ -366,14 +367,38 @@ function App() {
     });
   };
 
+  const renderSentenceItem = ({item}: {item: Sentence}) => (
+    <Pressable onPress={() => skipTo(item.id)}>
+      <Text style={[styles.sentence, item.id === current && styles.currentSentence]}>{renderSentence(item)}</Text>
+    </Pressable>
+  );
+
+  const handleScrollToIndexFailed = (info: {
+    index: number;
+    highestMeasuredFrameIndex: number;
+    averageItemLength: number;
+  }) => {
+    listRef.current?.scrollToOffset({
+      offset: Math.max(0, info.averageItemLength * info.index),
+      animated: false,
+    });
+    setTimeout(() => {
+      listRef.current?.scrollToIndex({
+        index: info.index,
+        animated: true,
+        viewPosition: 0.2,
+      });
+    }, 100);
+  };
+
   useEffect(() => {
     commandHandlerRef.current = command => {
       if (command === 'pause') {
         void playPause();
       } else if (command === 'previous') {
-        void jump(current - 1);
+        void skipTo(current - 1);
       } else if (command === 'next') {
-        void jump(current + 1);
+        void skipTo(current + 1);
       }
     };
     timingHandlerRef.current = startWordProgress;
@@ -401,18 +426,18 @@ function App() {
         <View style={[styles.progressFill, {width: `${progress}%`}]} />
       </View>
 
-      <ScrollView ref={scrollRef} contentContainerStyle={styles.readerContent}>
-        {sentences.map(sentence => (
-          <Pressable
-            key={sentence.id}
-            onPress={() => jump(sentence.id)}
-            onLayout={event => recordSentenceLayout(sentence.id, event)}>
-            <Text style={[styles.sentence, sentence.id === current && styles.currentSentence]}>
-              {renderSentence(sentence)}
-            </Text>
-          </Pressable>
-        ))}
-      </ScrollView>
+      <FlatList
+        ref={listRef}
+        data={sentences}
+        keyExtractor={item => String(item.id)}
+        renderItem={renderSentenceItem}
+        contentContainerStyle={styles.readerContent}
+        initialNumToRender={18}
+        maxToRenderPerBatch={12}
+        windowSize={9}
+        removeClippedSubviews
+        onScrollToIndexFailed={handleScrollToIndexFailed}
+      />
 
       <View style={styles.bottomBar}>
         <Text style={styles.status} numberOfLines={2}>
@@ -420,7 +445,10 @@ function App() {
         </Text>
 
         <View style={styles.controls}>
-          <Pressable style={styles.iconButton} onPress={() => jump(current - 1)} disabled={busy || current === 0}>
+          <Pressable
+            style={styles.iconButton}
+            onPress={() => skipTo(current - 1)}
+            disabled={(busy && !playing) || current === 0}>
             <Text style={styles.iconButtonText}>‹</Text>
           </Pressable>
           <Pressable
@@ -431,8 +459,8 @@ function App() {
           </Pressable>
           <Pressable
             style={styles.iconButton}
-            onPress={() => jump(current + 1)}
-            disabled={busy || current >= sentences.length - 1}>
+            onPress={() => skipTo(current + 1)}
+            disabled={(busy && !playing) || current >= sentences.length - 1}>
             <Text style={styles.iconButtonText}>›</Text>
           </Pressable>
         </View>

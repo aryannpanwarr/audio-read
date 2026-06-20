@@ -140,12 +140,15 @@ class KokoroTtsModule(
   @ReactMethod
   fun stop(promise: Promise) {
     LogStore.write(TAG, "stop requested")
-    executor.execute {
-      stopped = true
+    stopped = true
+    try {
       track?.pause()
       track?.flush()
       LogStore.write(TAG, "stop resolved")
       promise.resolve(null)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "stop failed: ${e.stackTraceToString()}")
+      promise.reject("KOKORO_STOP_FAILED", e.message, e)
     }
   }
 
