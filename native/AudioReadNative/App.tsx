@@ -37,6 +37,11 @@ type PickedDocument = {
   kind: 'pdf' | 'epub' | 'text';
 };
 
+type SpeechTiming = {
+  audioDurationSeconds: number;
+  wordCount: number;
+};
+
 type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
   speak(text: string, speakerId: number, speed: number): Promise<SpeakResult>;
@@ -117,6 +122,14 @@ function formatDuration(seconds: number) {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+function splitWords(text: string) {
+  return text.split(/(\s+)/).filter(part => part.length > 0);
+}
+
+function isWord(part: string) {
+  return /\S/.test(part);
+}
+
 function App() {
   const dark = useColorScheme() === 'dark';
   const colors = dark ? darkColors : lightColors;
@@ -133,10 +146,47 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('Open a PDF or EPUB to begin');
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
+  const [activeWordCount, setActiveWordCount] = useState(0);
   const playTokenRef = useRef(0);
   const scrollRef = useRef<ScrollView>(null);
   const sentenceYRef = useRef<Record<number, number>>({});
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
+  const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
+  const wordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sentencesRef = useRef(sentences);
+  const currentRef = useRef(current);
+
+  function clearWordProgress() {
+    if (wordTimerRef.current) {
+      clearInterval(wordTimerRef.current);
+      wordTimerRef.current = null;
+    }
+    setActiveWordCount(0);
+  }
+
+  function startWordProgress(timing: SpeechTiming) {
+    clearWordProgress();
+    const sentence = sentencesRef.current[currentRef.current];
+    if (!sentence || timing.audioDurationSeconds <= 0) return;
+    const wordCount = Math.max(
+      1,
+      splitWords(sentence.text).filter(isWord).length || timing.wordCount,
+    );
+    const durationMs = Math.max(300, timing.audioDurationSeconds * 1000);
+    const startedAt = Date.now();
+    setActiveWordCount(1);
+    wordTimerRef.current = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const nextCount = Math.min(wordCount, Math.max(1, Math.ceil((elapsed / durationMs) * wordCount)));
+      setActiveWordCount(nextCount);
+      if (nextCount >= wordCount) {
+        if (wordTimerRef.current) {
+          clearInterval(wordTimerRef.current);
+          wordTimerRef.current = null;
+        }
+      }
+    }, 80);
+  }
 
   useEffect(() => {
     recordLog('reader app mounted');
@@ -149,12 +199,24 @@ function App() {
 
   useEffect(() => {
     const emitter = new NativeEventEmitter(NativeModules.KokoroTts);
-    const subscription = emitter.addListener('AudioReadPlaybackCommand', command => {
+    const commandSubscription = emitter.addListener('AudioReadPlaybackCommand', command => {
       recordLog(`ui playback command ${String(command)}`);
       commandHandlerRef.current(String(command));
     });
-    return () => subscription.remove();
+    const timingSubscription = emitter.addListener('AudioReadSpeechTiming', timing => {
+      timingHandlerRef.current(timing as SpeechTiming);
+    });
+    return () => {
+      commandSubscription.remove();
+      timingSubscription.remove();
+      clearWordProgress();
+    };
   }, []);
+
+  useEffect(() => {
+    sentencesRef.current = sentences;
+    currentRef.current = current;
+  }, [sentences, current]);
 
   useEffect(() => {
     const y = sentenceYRef.current[current];
@@ -185,6 +247,7 @@ function App() {
       playTokenRef.current++;
       await KokoroTts.stop();
       await KokoroTts.stopPlaybackSession();
+      clearWordProgress();
       setPlaying(false);
       setDocumentTitle(doc.title);
       setDocumentKind(doc.kind);
@@ -220,6 +283,7 @@ function App() {
         if (token !== playTokenRef.current) return;
         const sentence = sentences[index];
         setCurrent(index);
+        setActiveWordCount(0);
         setStatus(`Reading ${index + 1} of ${sentences.length}`);
         recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
         const result = await KokoroTts.speak(sentence.text, speakerId, speed);
@@ -228,11 +292,13 @@ function App() {
       }
       setStatus('Finished');
       setPlaying(false);
+      clearWordProgress();
       await KokoroTts.stopPlaybackSession();
     } catch (error) {
       const message = describeError(error);
       setStatus('Playback failed');
       setPlaying(false);
+      clearWordProgress();
       await KokoroTts.stopPlaybackSession().catch(() => {});
       Alert.alert('Playback failed', message);
       recordLog(`ui playback failed ${message}`);
@@ -252,6 +318,7 @@ function App() {
       setBusy(false);
       await KokoroTts.stop();
       await KokoroTts.stopPlaybackSession();
+      clearWordProgress();
       setStatus('Paused');
       return;
     }
@@ -265,6 +332,7 @@ function App() {
     playTokenRef.current++;
     await KokoroTts.stop();
     await KokoroTts.stopPlaybackSession();
+    clearWordProgress();
     setCurrent(bounded);
     setPlaying(false);
     setBusy(false);
@@ -284,6 +352,20 @@ function App() {
     sentenceYRef.current[id] = event.nativeEvent.layout.y;
   };
 
+  const renderSentence = (sentence: Sentence) => {
+    if (sentence.id !== current) return sentence.text;
+    let spokenWords = 0;
+    return splitWords(sentence.text).map((part, index) => {
+      if (!isWord(part)) return part;
+      spokenWords += 1;
+      return (
+        <Text key={`${sentence.id}-${index}`} style={spokenWords <= activeWordCount && styles.spokenWord}>
+          {part}
+        </Text>
+      );
+    });
+  };
+
   useEffect(() => {
     commandHandlerRef.current = command => {
       if (command === 'pause') {
@@ -294,6 +376,7 @@ function App() {
         void jump(current + 1);
       }
     };
+    timingHandlerRef.current = startWordProgress;
   });
 
   return (
@@ -325,7 +408,7 @@ function App() {
             onPress={() => jump(sentence.id)}
             onLayout={event => recordSentenceLayout(sentence.id, event)}>
             <Text style={[styles.sentence, sentence.id === current && styles.currentSentence]}>
-              {sentence.text}
+              {renderSentence(sentence)}
             </Text>
           </Pressable>
         ))}
@@ -504,6 +587,11 @@ function makeStyles(colors: typeof lightColors) {
       backgroundColor: colors.highlight,
       color: colors.text,
       fontWeight: '700',
+    },
+    spokenWord: {
+      color: colors.accent,
+      backgroundColor: colors.surface,
+      fontWeight: '900',
     },
     bottomBar: {
       position: 'absolute',

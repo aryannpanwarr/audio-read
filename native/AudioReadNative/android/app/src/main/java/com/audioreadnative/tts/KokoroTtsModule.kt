@@ -116,6 +116,7 @@ class KokoroTtsModule(
           "speak resolved elapsed=${"%.3f".format(elapsed)} audioDuration=${"%.3f".format(audioDuration)} rtf=${"%.3f".format(rtf)} samples=${audio.samples.size}",
         )
         if (!stopped && audio.samples.isNotEmpty()) {
+          emitSpeechTiming(audioDuration, cleanText.wordCount())
           LogStore.write(TAG, "speak writing ${audio.samples.size} samples to AudioTrack")
           audioTrack.write(audio.samples, 0, audio.samples.size, AudioTrack.WRITE_BLOCKING)
           LogStore.write(TAG, "speak finished AudioTrack write")
@@ -238,6 +239,16 @@ class KokoroTtsModule(
       .emit("AudioReadPlaybackCommand", command)
   }
 
+  private fun emitSpeechTiming(audioDuration: Double, wordCount: Int) {
+    val map = Arguments.createMap().apply {
+      putDouble("audioDurationSeconds", audioDuration)
+      putInt("wordCount", wordCount)
+    }
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit("AudioReadSpeechTiming", map)
+  }
+
   private fun ensureTts(): OfflineTts {
     tts?.let {
       LogStore.write(TAG, "ensureTts reused existing model")
@@ -344,3 +355,6 @@ class KokoroTtsModule(
     }
   }
 }
+
+private fun String.wordCount(): Int =
+  trim().split(Regex("\\s+")).count { it.isNotBlank() }
