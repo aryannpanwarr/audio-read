@@ -23,6 +23,10 @@ class MainApplication : Application(), ReactApplication {
 
   override fun onCreate() {
     super.onCreate()
+    LogStore.init(this)
+    LogStore.installCrashHandler()
+    LogStore.write("app", "before-load-react-native")
     loadReactNative(this)
+    LogStore.write("app", "after-load-react-native")
   }
 }

@@ -34,3 +34,7 @@ Enable USB debugging, connect the phone, accept the RSA prompt, then run:
 ```
 
 The APK is large because it packages Kokoro locally.
+
+## Crash Logs
+
+Each app launch writes a new run log under app-private storage. Use **Export logs** in the app to share a text file containing the latest runs. If Kokoro crashes during Initialize or Speak, reopen the app and tap **Export logs** before trying again.

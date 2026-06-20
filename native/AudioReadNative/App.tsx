@@ -31,9 +31,35 @@ type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
   speak(text: string, speakerId: number, speed: number): Promise<SpeakResult>;
   stop(): Promise<void>;
+  record(message: string): Promise<void>;
+  exportLogs(): Promise<string>;
 };
 
 const KokoroTts = NativeModules.KokoroTts as KokoroTtsModule;
+
+declare const global: {
+  ErrorUtils?: {
+    getGlobalHandler?: () => (error: unknown, isFatal?: boolean) => void;
+    setGlobalHandler?: (handler: (error: unknown, isFatal?: boolean) => void) => void;
+  };
+};
+
+const describeError = (error: unknown) => {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}\n${error.stack ?? ''}`;
+  }
+  return String(error);
+};
+
+const recordLog = (message: string) => {
+  void KokoroTts.record(message).catch(() => {});
+};
+
+const previousErrorHandler = global.ErrorUtils?.getGlobalHandler?.();
+global.ErrorUtils?.setGlobalHandler?.((error, isFatal) => {
+  recordLog(`global-js-error fatal=${Boolean(isFatal)} ${describeError(error)}`);
+  previousErrorHandler?.(error, isFatal);
+});
 
 const SAMPLE =
   'Today as always, men fall into two groups: slaves and free men. Whoever does not have two-thirds of his day for himself, is a slave.';
@@ -67,13 +93,16 @@ function App() {
 
   const initialize = async () => {
     try {
+      recordLog('ui initialize pressed');
       setBusy(true);
       setStatus('Loading Kokoro model...');
       const info = await KokoroTts.initialize();
+      recordLog(`ui initialize resolved sampleRate=${info.sampleRate} speakers=${info.speakers}`);
       setReady(info);
       setStatus(`Ready: ${info.model}, ${info.sampleRate} Hz, ${info.speakers} voices`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = describeError(error);
+      recordLog(`ui initialize failed ${message}`);
       setStatus('Initialization failed');
       Alert.alert('Kokoro failed to initialize', message);
     } finally {
@@ -83,14 +112,17 @@ function App() {
 
   const speak = async () => {
     try {
+      recordLog(`ui speak pressed chars=${text.length} speakerId=${speakerId} speed=${speed}`);
       setBusy(true);
       setResult(null);
       setStatus('Synthesizing and streaming audio...');
       const metrics = await KokoroTts.speak(text, speakerId, speed);
+      recordLog(`ui speak resolved rtf=${metrics.rtf.toFixed(3)} elapsed=${metrics.elapsedSeconds.toFixed(3)}`);
       setResult(metrics);
       setStatus(metrics.rtf < 1 ? 'Pass: faster than real time' : 'Slow: slower than playback');
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = describeError(error);
+      recordLog(`ui speak failed ${message}`);
       setStatus('Synthesis failed');
       Alert.alert('Kokoro synthesis failed', message);
     } finally {
@@ -99,9 +131,20 @@ function App() {
   };
 
   const stop = async () => {
+    recordLog('ui stop pressed');
     await KokoroTts.stop();
     setBusy(false);
     setStatus('Stopped');
+  };
+
+  const exportLogs = async () => {
+    try {
+      recordLog('ui export logs pressed');
+      await KokoroTts.exportLogs();
+    } catch (error) {
+      const message = describeError(error);
+      Alert.alert('Could not export logs', message);
+    }
   };
 
   return (
@@ -179,6 +222,10 @@ function App() {
             <Text style={styles.secondaryButtonText}>Stop</Text>
           </Pressable>
         </View>
+
+        <Pressable style={styles.logButton} onPress={exportLogs}>
+          <Text style={styles.logButtonText}>Export logs</Text>
+        </Pressable>
 
         <View style={styles.panel}>
           <Text style={styles.label}>Status</Text>
@@ -326,6 +373,20 @@ function makeStyles(colors: typeof lightColors) {
     },
     secondaryButtonText: {
       color: colors.text,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    logButton: {
+      minHeight: 46,
+      borderColor: colors.accent,
+      borderWidth: 1,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 16,
+    },
+    logButtonText: {
+      color: colors.accent,
       fontSize: 16,
       fontWeight: '700',
     },

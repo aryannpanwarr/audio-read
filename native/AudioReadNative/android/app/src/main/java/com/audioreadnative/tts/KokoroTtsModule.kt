@@ -1,9 +1,12 @@
 package com.audioreadnative.tts
 
+import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import androidx.core.content.FileProvider
+import com.audioreadnative.LogStore
 import android.util.Log
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -34,6 +37,7 @@ class KokoroTtsModule(
 
   @ReactMethod
   fun initialize(promise: Promise) {
+    LogStore.write(TAG, "initialize requested")
     executor.execute {
       try {
         ensureTts()
@@ -41,9 +45,11 @@ class KokoroTtsModule(
         map.putInt("sampleRate", tts!!.sampleRate())
         map.putInt("speakers", tts!!.numSpeakers())
         map.putString("model", MODEL_DIR)
+        LogStore.write(TAG, "initialize resolved sampleRate=${tts!!.sampleRate()} speakers=${tts!!.numSpeakers()}")
         promise.resolve(map)
       } catch (e: Throwable) {
         Log.e(TAG, "initialize failed", e)
+        LogStore.write(TAG, "initialize failed: ${e.stackTraceToString()}")
         promise.reject("KOKORO_INIT_FAILED", e.message, e)
       }
     }
@@ -51,6 +57,7 @@ class KokoroTtsModule(
 
   @ReactMethod
   fun speak(text: String, speakerId: Int, speed: Double, promise: Promise) {
+    LogStore.write(TAG, "speak requested chars=${text.length} speakerId=$speakerId speed=$speed")
     executor.execute {
       try {
         val model = ensureTts()
@@ -85,16 +92,22 @@ class KokoroTtsModule(
         )
         val elapsed = (System.nanoTime() - start) / 1_000_000_000.0
         val audioDuration = audio.samples.size.toDouble() / audio.sampleRate.toDouble()
+        val rtf = if (audioDuration > 0.0) elapsed / audioDuration else 0.0
+        LogStore.write(
+          TAG,
+          "speak resolved elapsed=${"%.3f".format(elapsed)} audioDuration=${"%.3f".format(audioDuration)} rtf=${"%.3f".format(rtf)} samples=${audio.samples.size}",
+        )
 
         val map = Arguments.createMap()
         map.putDouble("elapsedSeconds", elapsed)
         map.putDouble("audioDurationSeconds", audioDuration)
-        map.putDouble("rtf", if (audioDuration > 0.0) elapsed / audioDuration else 0.0)
+        map.putDouble("rtf", rtf)
         map.putInt("sampleRate", audio.sampleRate)
         map.putInt("samples", audio.samples.size)
         promise.resolve(map)
       } catch (e: Throwable) {
         Log.e(TAG, "speak failed", e)
+        LogStore.write(TAG, "speak failed: ${e.stackTraceToString()}")
         promise.reject("KOKORO_SPEAK_FAILED", e.message, e)
       }
     }
@@ -102,15 +115,50 @@ class KokoroTtsModule(
 
   @ReactMethod
   fun stop(promise: Promise) {
+    LogStore.write(TAG, "stop requested")
     executor.execute {
       stopped = true
       track?.pause()
       track?.flush()
+      LogStore.write(TAG, "stop resolved")
       promise.resolve(null)
     }
   }
 
+  @ReactMethod
+  fun record(message: String, promise: Promise) {
+    LogStore.write("js", message)
+    promise.resolve(null)
+  }
+
+  @ReactMethod
+  fun exportLogs(promise: Promise) {
+    try {
+      LogStore.write(TAG, "exportLogs requested")
+      val file = LogStore.exportFile(reactContext)
+      val uri = FileProvider.getUriForFile(
+        reactContext,
+        "${reactContext.packageName}.fileprovider",
+        file,
+      )
+      val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      reactContext.startActivity(Intent.createChooser(intent, "Export Audio Read logs").apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      })
+      promise.resolve(file.absolutePath)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "exportLogs failed: ${e.stackTraceToString()}")
+      promise.reject("LOG_EXPORT_FAILED", e.message, e)
+    }
+  }
+
   override fun invalidate() {
+    LogStore.write(TAG, "invalidate")
     stopped = true
     track?.release()
     track = null
@@ -121,14 +169,20 @@ class KokoroTtsModule(
   }
 
   private fun ensureTts(): OfflineTts {
-    tts?.let { return it }
+    tts?.let {
+      LogStore.write(TAG, "ensureTts reused existing model")
+      return it
+    }
 
+    LogStore.write(TAG, "ensureTts checking assets")
     assertAsset("$MODEL_DIR/model.onnx")
     assertAsset("$MODEL_DIR/voices.bin")
     assertAsset("$MODEL_DIR/tokens.txt")
 
     val dataDirAsset = "$MODEL_DIR/espeak-ng-data"
+    LogStore.write(TAG, "ensureTts copying data dir $dataDirAsset")
     val dataRoot = copyDataDir(dataDirAsset)
+    LogStore.write(TAG, "ensureTts copied data root $dataRoot")
     val config = getOfflineTtsConfig(
       modelDir = MODEL_DIR,
       modelName = "model.onnx",
@@ -142,7 +196,11 @@ class KokoroTtsModule(
       ruleFars = "",
       numThreads = 4,
     )
-    return OfflineTts(assetManager = reactContext.assets, config = config).also { tts = it }
+    LogStore.write(TAG, "ensureTts creating OfflineTts")
+    return OfflineTts(assetManager = reactContext.assets, config = config).also {
+      tts = it
+      LogStore.write(TAG, "ensureTts created sampleRate=${it.sampleRate()} speakers=${it.numSpeakers()}")
+    }
   }
 
   private fun ensureAudioTrack(sampleRate: Int): AudioTrack {
@@ -168,13 +226,18 @@ class KokoroTtsModule(
       minBufferSize,
       AudioTrack.MODE_STREAM,
       AudioManager.AUDIO_SESSION_ID_GENERATE,
-    ).also { track = it }
+    ).also {
+      track = it
+      LogStore.write(TAG, "created AudioTrack sampleRate=$sampleRate minBufferSize=$minBufferSize")
+    }
   }
 
   private fun assertAsset(path: String) {
     try {
       reactContext.assets.open(path).use { }
+      LogStore.write(TAG, "asset ok $path")
     } catch (e: IOException) {
+      LogStore.write(TAG, "asset missing $path")
       throw IllegalStateException(
         "Missing Android asset $path. Run scripts/setup-kokoro-android.sh from native/AudioReadNative.",
         e,
