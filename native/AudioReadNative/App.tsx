@@ -27,6 +27,7 @@ type SpeakResult = {
   rtf: number;
   sampleRate: number;
   samples: number;
+  cached?: boolean;
 };
 
 type PickedDocument = {
@@ -43,7 +44,7 @@ type SpeechTiming = {
 
 type KokoroTtsModule = {
   initialize(): Promise<InitResult>;
-  speak(text: string, speakerId: number, speed: number): Promise<SpeakResult>;
+  speak(text: string, speakerId: number, speed: number, nextText: string): Promise<SpeakResult>;
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
@@ -286,9 +287,13 @@ function App() {
         setActiveWordCount(0);
         setStatus(`Reading ${index + 1} of ${sentences.length}`);
         recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
-        const result = await KokoroTts.speak(sentence.text, speakerId, speed);
+        const nextSentence = sentences[index + 1]?.text ?? '';
+        const result = await KokoroTts.speak(sentence.text, speakerId, speed, nextSentence);
         if (token !== playTokenRef.current) return;
         setLastResult(result);
+        recordLog(
+          `ui sentence done index=${index} generation=${result.elapsedSeconds.toFixed(3)}s audio=${result.audioDurationSeconds.toFixed(3)}s rtf=${result.rtf.toFixed(3)} cached=${Boolean(result.cached)}`,
+        );
       }
       setStatus('Finished');
       setPlaying(false);
