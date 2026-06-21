@@ -11,12 +11,14 @@ const els = {
   previewText: document.getElementById('previewText'),
   speed: document.getElementById('speed'),
   dtype: document.getElementById('dtype'),
+  device: document.getElementById('device'),
   limit: document.getElementById('limit'),
   dryRun: document.getElementById('dryRun'),
   start: document.getElementById('start'),
   cancel: document.getElementById('cancel'),
   state: document.getElementById('state'),
   detail: document.getElementById('detail'),
+  previewPlayer: document.getElementById('previewPlayer'),
   progress: document.getElementById('progressFill'),
   log: document.getElementById('log'),
   clearLog: document.getElementById('clearLog'),
@@ -62,6 +64,7 @@ els.start.addEventListener('click', async () => {
     voice: els.voice.value,
     speed: els.speed.value,
     dtype: els.dtype.value,
+    device: els.device.value,
     limit: els.limit.value,
     dryRun: els.dryRun.checked,
   }
@@ -84,6 +87,7 @@ els.previewVoice.addEventListener('click', async () => {
     voice: els.voice.value,
     speed: els.speed.value,
     dtype: els.dtype.value,
+    device: els.device.value,
     previewText: els.previewText.value,
   }
   setRunning(true)
@@ -119,6 +123,11 @@ api.onLog(chunk => {
 api.onDone(payload => {
   lastOutput = payload.output
   els.openOutput.disabled = false
+  if (payload.previewUrl) {
+    els.previewPlayer.src = payload.previewUrl
+    els.previewPlayer.hidden = false
+    void els.previewPlayer.play().catch(() => {})
+  }
   setState(payload.ok ? 'Done' : 'Failed', payload.ok ? payload.output : `Exited with code ${payload.code}`)
   els.progress.style.width = payload.ok ? '100%' : els.progress.style.width
   setRunning(false)

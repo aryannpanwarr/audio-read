@@ -28,16 +28,18 @@ mkdirSync(outDir, { recursive: true })
 
 const voice = args.voice ?? DEFAULT_VOICE
 const speed = Number(args.speed ?? '1')
+const device = args.device ?? 'cpu'
 const limit = args.limit ? Math.max(1, Number(args.limit)) : null
 
 if (inputPath) console.log(`Input: ${inputPath}`)
 console.log(`Output: ${outDir}`)
 console.log(`Voice: ${voice}`)
 console.log(`Speed: ${speed}`)
+console.log(`Device: ${device}`)
 
 if (args.previewVoice) {
   console.log('Loading Kokoro...')
-  const tts = await loadKokoro(args.dtype)
+  const tts = await loadKokoro(args.dtype, device)
   const previewText = args.previewText ?? DEFAULT_PREVIEW_TEXT
   const previewPath = join(outDir, `voice-preview-${safeName(voice)}.wav`)
   console.log(`Preview text: ${previewText}`)
@@ -87,7 +89,7 @@ if (args.dryRun) {
   process.exit(0)
 }
 console.log('Loading Kokoro...')
-const tts = await loadKokoro(args.dtype)
+const tts = await loadKokoro(args.dtype, device)
 
 const manifest = {
   version: 1,
@@ -145,6 +147,7 @@ function parseArgs(argv) {
     else if (arg === '--voice') out.voice = argv[++i]
     else if (arg === '--speed') out.speed = argv[++i]
     else if (arg === '--dtype') out.dtype = argv[++i]
+    else if (arg === '--device') out.device = argv[++i]
     else if (arg === '--limit') out.limit = argv[++i]
     else if (arg === '--dry-run') out.dryRun = true
     else if (arg === '--preview-voice') out.previewVoice = true
@@ -165,16 +168,17 @@ Options:
   --voice       Kokoro voice, default ${DEFAULT_VOICE}
   --speed       Speech speed, default 1
   --dtype       q8, fp32, fp16, q4, q4f16; default q8
+  --device      cpu or cuda; default cpu
   --limit       Generate only first N segments for a quick sample
   --dry-run     Extract/segment only; do not load Kokoro or generate audio
   --preview-voice Generate one short WAV sample for the selected voice
   --preview-text  Text to use with --preview-voice`)
 }
 
-async function loadKokoro(dtype) {
+async function loadKokoro(dtype, device) {
   const tts = await KokoroTTS.from_pretrained(MODEL_ID, {
     dtype: dtype ?? 'q8',
-    device: 'cpu',
+    device: device ?? 'cpu',
     progress_callback: (p) => {
       if (p.status === 'progress' && p.total) {
         const pct = Math.round((p.loaded / p.total) * 100)

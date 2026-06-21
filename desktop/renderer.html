@@ -69,6 +69,14 @@
           </label>
 
           <label class="field">
+            Backend
+            <select id="device">
+              <option value="cpu">CPU</option>
+              <option value="cuda">CUDA / RTX</option>
+            </select>
+          </label>
+
+          <label class="field">
             Segment Limit
             <input id="limit" type="number" min="1" step="1" placeholder="Blank = full book" />
           </label>
@@ -95,6 +103,7 @@
           <strong id="state">Idle</strong>
           <span id="detail">Choose a book to start.</span>
         </div>
+        <audio id="previewPlayer" controls></audio>
         <div class="progress">
           <div id="progressFill"></div>
         </div>
