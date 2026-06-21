@@ -141,8 +141,6 @@ class DocumentModule(
           put("createdAt", now)
           put("updatedAt", now)
           put("lastPosition", 0)
-          put("preparedAudioSeconds", 0.0)
-          put("cacheStatus", "queued")
         }
         val items = readLibraryIndex().filter { it.optString("uri") != uri }.toMutableList()
         items.add(item)

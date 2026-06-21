@@ -9,7 +9,6 @@ module.exports = [
       'android/**',
       'ios/**',
       'node_modules/**',
-      '.kokoro-downloads/**',
       '.toolchains/**',
     ],
   },

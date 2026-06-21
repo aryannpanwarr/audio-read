@@ -105,9 +105,6 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
-    androidResources {
-        noCompress += ["onnx", "bin"]
-    }
 }
 
 dependencies {

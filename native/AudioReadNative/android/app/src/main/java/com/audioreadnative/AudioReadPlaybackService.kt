@@ -73,7 +73,7 @@ class AudioReadPlaybackService : Service() {
     )
     return Notification.Builder(this, CHANNEL_ID)
       .setContentTitle("Audio Read")
-      .setContentText("Reading with Kokoro")
+      .setContentText("Reading with Android system voice")
       .setSmallIcon(android.R.drawable.ic_media_play)
       .setContentIntent(pendingIntent)
       .addAction(

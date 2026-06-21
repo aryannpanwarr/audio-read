@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useRef, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
   FlatList,
@@ -15,10 +15,18 @@ import {
   useColorScheme,
 } from 'react-native';
 
+type TtsVoice = {
+  name: string;
+  locale: string;
+  quality: number;
+};
+
 type InitResult = {
   sampleRate: number;
   speakers: number;
   model: string;
+  engine?: string;
+  voices?: TtsVoice[];
 };
 
 type SpeakResult = {
@@ -27,7 +35,8 @@ type SpeakResult = {
   rtf: number;
   sampleRate: number;
   samples: number;
-  cached?: boolean;
+  source?: string;
+  wordCount?: number;
 };
 
 type PickedDocument = {
@@ -47,9 +56,6 @@ type LibraryBook = {
   createdAt: number;
   updatedAt: number;
   lastPosition: number;
-  preparedAudioSeconds: number;
-  cacheProgressPercent?: number;
-  cacheStatus: string;
 };
 
 type LoadedLibraryBook = LibraryBook & {
@@ -61,37 +67,12 @@ type SpeechTiming = {
   wordCount: number;
 };
 
-type PrebufferProgress = {
-  requestId?: string;
-  processed: number;
-  total: number;
-  cacheHits: number;
-  audioDurationSeconds: number;
-  elapsedSeconds: number;
-};
-
-type PrebufferResult = {
-  requestId?: string;
-  generated: number;
-  cacheHits: number;
-  audioDurationSeconds: number;
-  elapsedSeconds: number;
-};
-
-type KokoroTtsModule = {
+type SystemTtsModule = {
   initialize(): Promise<InitResult>;
-  speak(text: string, speakerId: number, speed: number, nextText: string): Promise<SpeakResult>;
-  prebuffer(
-    texts: string[],
-    speakerId: number,
-    speed: number,
-    targetAudioSeconds: number,
-    requestId: string,
-  ): Promise<PrebufferResult>;
+  speak(text: string, voiceName: string | null, speed: number): Promise<SpeakResult>;
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
-  notifyPreparationDone(title: string, audioDurationSeconds: number): Promise<void>;
   requestBackgroundPlaybackPermission(): Promise<boolean>;
   record(message: string): Promise<void>;
   exportLogs(): Promise<string>;
@@ -112,7 +93,7 @@ type DocumentReaderModule = {
   deleteLibraryDocument(id: string): Promise<void>;
 };
 
-const KokoroTts = NativeModules.KokoroTts as KokoroTtsModule;
+const SystemTts = NativeModules.SystemTts as SystemTtsModule;
 const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
 
 declare const global: {
@@ -122,25 +103,10 @@ declare const global: {
   };
 };
 
-const VOICES = [
-  'Heart',
-  'Bella',
-  'Nicole',
-  'Sarah',
-  'Sky',
-  'Adam',
-  'Michael',
-  'Emma',
-  'Isabella',
-  'George',
-  'Lewis',
-];
-
-const INITIAL_BUFFER_SECONDS = 18;
-const BACKGROUND_BUFFER_SECONDS = 240;
-const LIBRARY_PREP_SECONDS = 600;
-const LIBRARY_READY_SECONDS = 60;
-const MAX_BUFFER_SENTENCES = 160;
+type Sentence = {
+  id: number;
+  text: string;
+};
 
 const describeError = (error: unknown) => {
   if (error instanceof Error) {
@@ -150,7 +116,7 @@ const describeError = (error: unknown) => {
 };
 
 const recordLog = (message: string) => {
-  void KokoroTts.record(message).catch(() => {});
+  void SystemTts.record(message).catch(() => {});
 };
 
 const previousErrorHandler = global.ErrorUtils?.getGlobalHandler?.();
@@ -158,11 +124,6 @@ global.ErrorUtils?.setGlobalHandler?.((error, isFatal) => {
   recordLog(`global-js-error fatal=${Boolean(isFatal)} ${describeError(error)}`);
   previousErrorHandler?.(error, isFatal);
 });
-
-type Sentence = {
-  id: number;
-  text: string;
-};
 
 function splitSentences(text: string): Sentence[] {
   const paragraphs = text
@@ -172,11 +133,11 @@ function splitSentences(text: string): Sentence[] {
     .map(part => part.replace(/\s{2,}/g, ' ').trim())
     .filter(isReadableParagraph);
   const rawParts = paragraphs.flatMap(paragraph => {
-    if (isHeading(paragraph) || isContentsLine(paragraph)) return [paragraph];
+    if (isHeading(paragraph)) return [paragraph];
     return paragraph.match(/[^.!?]+(?:[.!?]+["')\]]+|[.!?]+)?|[^.!?]+$/g) ?? [paragraph];
   });
   return mergeSpeechParts(rawParts.map(part => part.trim()).filter(isReadableParagraph))
-    .slice(0, 5000)
+    .slice(0, 8000)
     .map((part, index) => ({id: index, text: part}));
 }
 
@@ -184,17 +145,12 @@ function isReadableParagraph(text: string) {
   if (text.length < 2) return false;
   if (/^(?:page\s*)?\d{1,4}$/i.test(text)) return false;
   if (/^\[?(?:pg|page)\s*\d{1,4}\]?$/i.test(text)) return false;
-  if (/^(?:chapter|part|book)\s+[ivxlcdm\d]+\.?$/i.test(text) && text.length < 18) return true;
   return /[A-Za-z0-9]/.test(text);
 }
 
 function isHeading(text: string) {
-  if (text.length > 110) return false;
+  if (text.length > 120) return false;
   return /^(chapter|part|book|volume)\b/i.test(text) || /^[A-Z0-9 ,.'"-]{8,}$/.test(text);
-}
-
-function isContentsLine(text: string) {
-  return /^contents$/i.test(text) || /^(chapter|part)\s+[ivxlcdm\d]+\.?\s+.+/i.test(text);
 }
 
 function mergeSpeechParts(parts: string[]) {
@@ -202,7 +158,7 @@ function mergeSpeechParts(parts: string[]) {
   let carry = '';
   parts.forEach(part => {
     const current = carry ? `${carry} ${part}`.trim() : part;
-    if (isHeading(current) || isContentsLine(current)) {
+    if (isHeading(current)) {
       if (carry && carry !== current) merged.push(carry);
       merged.push(part);
       carry = '';
@@ -222,26 +178,7 @@ function mergeSpeechParts(parts: string[]) {
       merged.push(carry);
     }
   }
-  return merged.filter(part => part.length > 0);
-}
-
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.round(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
-}
-
-function cachePercent(processed: number, total: number) {
-  if (!Number.isFinite(processed) || !Number.isFinite(total) || total <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
-}
-
-function bookCachePercent(book: LibraryBook) {
-  if (Number.isFinite(book.cacheProgressPercent)) {
-    return Math.max(0, Math.min(100, Math.round(book.cacheProgressPercent ?? 0)));
-  }
-  return book.cacheStatus === 'ready' ? 100 : 0;
+  return merged.filter(Boolean);
 }
 
 function splitWords(text: string) {
@@ -250,6 +187,13 @@ function splitWords(text: string) {
 
 function isWord(part: string) {
   return /\S/.test(part);
+}
+
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
 function App() {
@@ -264,15 +208,14 @@ function App() {
   const [documentKind, setDocumentKind] = useState<'pdf' | 'epub' | 'text'>('text');
   const [sentences, setSentences] = useState<Sentence[]>([]);
   const [current, setCurrent] = useState(0);
-  const [speakerId, setSpeakerId] = useState(2);
-  const [speed, setSpeed] = useState(0.95);
+  const [speed, setSpeed] = useState(1);
   const [ready, setReady] = useState<InitResult | null>(null);
+  const [voiceIndex, setVoiceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('Library ready');
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
-  const [cacheStatus, setCacheStatus] = useState('');
   const playTokenRef = useRef(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
@@ -280,14 +223,10 @@ function App() {
   const wordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
-  const backgroundBufferingRef = useRef(false);
-  const visiblePrebufferRef = useRef(false);
-  const visiblePrebufferRequestRef = useRef<string | null>(null);
-  const preparingBookRef = useRef<LibraryBook | null>(null);
-  const prebufferBooksRef = useRef<Record<string, string>>({});
-  const metadataUpdateRef = useRef<Record<string, number>>({});
-  const prebufferRequestCounterRef = useRef(0);
   const backgroundPermissionPromptedRef = useRef(false);
+
+  const voices = ready?.voices ?? [];
+  const selectedVoice = voices[voiceIndex]?.name ?? null;
 
   function updateBookInState(book: LibraryBook) {
     setLibrary(items => [book, ...items.filter(item => item.id !== book.id)]);
@@ -316,13 +255,11 @@ function App() {
       const elapsed = Date.now() - startedAt;
       const nextCount = Math.min(wordCount, Math.max(1, Math.ceil((elapsed / durationMs) * wordCount)));
       setActiveWordCount(nextCount);
-      if (nextCount >= wordCount) {
-        if (wordTimerRef.current) {
-          clearInterval(wordTimerRef.current);
-          wordTimerRef.current = null;
-        }
+      if (nextCount >= wordCount && wordTimerRef.current) {
+        clearInterval(wordTimerRef.current);
+        wordTimerRef.current = null;
       }
-    }, 80);
+    }, 90);
   }
 
   const refreshLibrary = async () => {
@@ -330,7 +267,6 @@ function App() {
       const items = await DocumentReader.listLibrary();
       setLibrary(items);
       recordLog(`ui library loaded count=${items.length}`);
-      void resumeLibraryPreparation(items);
     } catch (error) {
       recordLog(`ui library load failed ${describeError(error)}`);
     }
@@ -340,26 +276,37 @@ function App() {
     if (backgroundPermissionPromptedRef.current || Platform.OS !== 'android') return;
     backgroundPermissionPromptedRef.current = true;
     try {
-      const opened = await KokoroTts.requestBackgroundPlaybackPermission();
+      const opened = await SystemTts.requestBackgroundPlaybackPermission();
       recordLog(`ui background permission prompt opened=${opened}`);
     } catch (error) {
       recordLog(`ui background permission prompt failed ${describeError(error)}`);
     }
   };
 
+  const ensureReady = useCallback(async () => {
+    if (ready) return ready;
+    setStatus('Loading Android voice...');
+    const info = await SystemTts.initialize();
+    setReady(info);
+    setVoiceIndex(0);
+    setStatus(`System TTS ready${info.engine ? ` · ${info.engine}` : ''}`);
+    return info;
+  }, [ready]);
+
   useEffect(() => {
     recordLog('reader app mounted');
     void Promise.resolve().then(refreshLibrary);
+    void Promise.resolve().then(ensureReady).catch(error => recordLog(`tts init failed ${describeError(error)}`));
     void Promise.resolve().then(requestBackgroundPermission);
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       void PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS).catch(error => {
         recordLog(`notification permission request failed ${describeError(error)}`);
       });
     }
-  }, []);
+  }, [ensureReady]);
 
   useEffect(() => {
-    const emitter = new NativeEventEmitter(NativeModules.KokoroTts);
+    const emitter = new NativeEventEmitter(NativeModules.SystemTts);
     const commandSubscription = emitter.addListener('AudioReadPlaybackCommand', command => {
       recordLog(`ui playback command ${String(command)}`);
       commandHandlerRef.current(String(command));
@@ -367,51 +314,9 @@ function App() {
     const timingSubscription = emitter.addListener('AudioReadSpeechTiming', timing => {
       timingHandlerRef.current(timing as SpeechTiming);
     });
-    const prebufferSubscription = emitter.addListener('AudioReadPrebufferProgress', progress => {
-      const info = progress as PrebufferProgress;
-      const requestId = info.requestId ?? '';
-      const bookId = prebufferBooksRef.current[requestId];
-      const percent = cachePercent(info.processed, info.total);
-      const isVisibleRequest = visiblePrebufferRef.current && visiblePrebufferRequestRef.current === requestId;
-      if (isVisibleRequest) {
-        setStatus(
-          `Preparing ${percent}% · ${formatDuration(info.audioDurationSeconds)} audio`,
-        );
-      } else if (bookId) {
-        const cacheText = `Caching ${percent}% · ${formatDuration(info.audioDurationSeconds)} audio`;
-        setCacheStatus(cacheText);
-        setLibrary(items =>
-          items.map(item =>
-            item.id === bookId
-              ? {
-                  ...item,
-                  cacheStatus: 'preparing',
-                  preparedAudioSeconds: info.audioDurationSeconds,
-                  cacheProgressPercent: percent,
-                }
-              : item,
-          ),
-        );
-        const now = Date.now();
-        if (now - (metadataUpdateRef.current[bookId] ?? 0) > 5000) {
-          metadataUpdateRef.current[bookId] = now;
-          void DocumentReader.updateLibraryDocument(bookId, {
-            cacheStatus: 'preparing',
-            preparedAudioSeconds: info.audioDurationSeconds,
-            cacheProgressPercent: percent,
-          })
-            .then(updateBookInState)
-            .catch(error => recordLog(`ui cache progress metadata update failed ${describeError(error)}`));
-        }
-      }
-      recordLog(
-        `ui prebuffer progress request=${requestId || 'none'} processed=${info.processed}/${info.total} audio=${info.audioDurationSeconds.toFixed(3)}s elapsed=${info.elapsedSeconds.toFixed(3)}s cacheHits=${info.cacheHits}`,
-      );
-    });
     return () => {
       commandSubscription.remove();
       timingSubscription.remove();
-      prebufferSubscription.remove();
       clearWordProgress();
     };
   }, []);
@@ -426,187 +331,12 @@ function App() {
       listRef.current?.scrollToIndex({
         index: current,
         animated: true,
-        viewPosition: 0.2,
+        viewPosition: 0.22,
       });
     }
   }, [current, sentences.length]);
 
   const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
-
-  const ensureReady = async () => {
-    if (ready) return ready;
-    setStatus('Loading Kokoro model...');
-    const info = await KokoroTts.initialize();
-    setReady(info);
-    setStatus(`Kokoro ready: ${info.sampleRate} Hz`);
-    return info;
-  };
-
-  const sentenceWindow = (startIndex: number) =>
-    sentences.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
-
-  const prebufferTexts = async (
-    texts: string[],
-    targetSeconds: number,
-    visible: boolean,
-    label: string,
-    bookId?: string,
-  ) => {
-    if (!texts.length) return null;
-    prebufferRequestCounterRef.current += 1;
-    const requestId = `pb-${prebufferRequestCounterRef.current}`;
-    visiblePrebufferRef.current = visible;
-    if (visible) visiblePrebufferRequestRef.current = requestId;
-    if (bookId) prebufferBooksRef.current[requestId] = bookId;
-    try {
-      if (visible) setStatus('Preparing audio buffer...');
-      const result = await KokoroTts.prebuffer(texts, speakerId, speed, targetSeconds, requestId);
-      recordLog(
-        `ui prebuffer done request=${requestId} label=${label} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
-      );
-      if (visible) {
-        setStatus(
-          result.audioDurationSeconds >= 1
-            ? `Prepared ${formatDuration(result.audioDurationSeconds)} audio`
-            : 'Caching paused',
-        );
-      }
-      return result;
-    } finally {
-      if (visible) {
-        visiblePrebufferRef.current = false;
-        if (visiblePrebufferRequestRef.current === requestId) visiblePrebufferRequestRef.current = null;
-      }
-      delete prebufferBooksRef.current[requestId];
-    }
-  };
-
-  const prebufferFrom = async (startIndex: number, targetSeconds: number, visible: boolean) =>
-    prebufferTexts(
-      sentenceWindow(startIndex),
-      targetSeconds,
-      visible,
-      `start=${startIndex}`,
-      activeBookId ?? undefined,
-    );
-
-  const startBackgroundBuffer = (startIndex: number) => {
-    if (backgroundBufferingRef.current) return;
-    backgroundBufferingRef.current = true;
-    if (activeBookId) {
-      preparingBookRef.current = library.find(item => item.id === activeBookId) ?? null;
-    }
-    void prebufferFrom(startIndex, BACKGROUND_BUFFER_SECONDS, false)
-      .catch(error => recordLog(`ui background prebuffer failed ${describeError(error)}`))
-      .finally(() => {
-        backgroundBufferingRef.current = false;
-        if (preparingBookRef.current?.id === activeBookId) {
-          preparingBookRef.current = null;
-        }
-      });
-  };
-
-  async function resumeLibraryPreparation(items: LibraryBook[]) {
-    if (backgroundBufferingRef.current || playing || busy) return;
-    const book = items.find(
-      item => item.cacheStatus !== 'failed' && item.preparedAudioSeconds < LIBRARY_PREP_SECONDS,
-    );
-    if (!book) return;
-    try {
-      recordLog(`ui library resume prepare id=${book.id} title=${book.title}`);
-      const loaded = await DocumentReader.loadLibraryDocument(book.id);
-      const parsed = splitSentences(loaded.text);
-      if (!parsed.length) return;
-      const startIndex = Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0));
-      startDocumentPreparation(parsed, loaded, startIndex);
-    } catch (error) {
-      recordLog(`ui library resume prepare failed ${describeError(error)}`);
-    }
-  }
-
-  function startDocumentPreparation(parsed: Sentence[], book: LibraryBook, startIndex = 0) {
-    const texts = parsed.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
-    if (!texts.length || backgroundBufferingRef.current) return;
-    backgroundBufferingRef.current = true;
-    preparingBookRef.current = book;
-    setCacheStatus(`Caching ${book.title}`);
-    void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'preparing'}).then(updateBookInState).catch(() => {});
-    recordLog(`ui library prepare started title=${book.title} start=${startIndex} sentences=${texts.length}`);
-    void ensureReady()
-      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${book.title}`, book.id))
-      .then(result => {
-        if (!result) return;
-        if (result.audioDurationSeconds < 1 && result.generated === 0 && result.cacheHits === 0) {
-          recordLog(`ui library prepare cancelled title=${book.title}`);
-          return;
-        }
-        recordLog(
-          `ui library prepare done title=${book.title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
-        );
-        const percent = cachePercent(result.generated + result.cacheHits, texts.length);
-        setCacheStatus(`Cached ${percent}%`);
-        const isReady = result.audioDurationSeconds >= LIBRARY_READY_SECONDS;
-        void DocumentReader.updateLibraryDocument(book.id, {
-          cacheStatus: isReady ? 'ready' : 'preparing',
-          preparedAudioSeconds: result.audioDurationSeconds,
-          cacheProgressPercent: percent,
-        })
-          .then(updateBookInState)
-          .catch(error => recordLog(`ui library prepare metadata update failed ${describeError(error)}`));
-        if (isReady) {
-          return KokoroTts.notifyPreparationDone(book.title, result.audioDurationSeconds);
-        }
-        return undefined;
-      })
-      .catch(error => {
-        void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'failed'}).then(updateBookInState).catch(() => {});
-        recordLog(`ui library prepare failed ${describeError(error)}`);
-      })
-      .finally(() => {
-        backgroundBufferingRef.current = false;
-        if (preparingBookRef.current?.id === book.id) {
-          preparingBookRef.current = null;
-        }
-      });
-  }
-
-  async function generateFullAudiobook(book: LibraryBook) {
-    if (backgroundBufferingRef.current) {
-      setStatus('Caching already running');
-      return;
-    }
-    try {
-      setStatus('Preparing full audiobook...');
-      const loaded = await DocumentReader.loadLibraryDocument(book.id);
-      const parsed = splitSentences(loaded.text);
-      if (!parsed.length) throw new Error('No readable text found in this book');
-      backgroundBufferingRef.current = true;
-      preparingBookRef.current = loaded;
-      const texts = parsed.map(sentence => sentence.text);
-      recordLog(`ui full audiobook prepare started title=${loaded.title} sentences=${texts.length}`);
-      await ensureReady();
-      const result = await prebufferTexts(texts, 86_400, false, `full=${loaded.title}`, loaded.id);
-      if (!result) return;
-      const percent = cachePercent(result.generated + result.cacheHits, texts.length);
-      const done = percent >= 100;
-      setCacheStatus(done ? 'Audiobook cached 100%' : `Audiobook cached ${percent}%`);
-      await DocumentReader.updateLibraryDocument(loaded.id, {
-        cacheStatus: done ? 'ready' : 'preparing',
-        preparedAudioSeconds: result.audioDurationSeconds,
-        cacheProgressPercent: percent,
-      }).then(updateBookInState);
-      if (done) await KokoroTts.notifyPreparationDone(loaded.title, result.audioDurationSeconds);
-      recordLog(
-        `ui full audiobook prepare done title=${loaded.title} percent=${percent} audio=${result.audioDurationSeconds.toFixed(3)}s`,
-      );
-    } catch (error) {
-      recordLog(`ui full audiobook prepare failed ${describeError(error)}`);
-      Alert.alert('Could not generate audiobook', describeError(error));
-    } finally {
-      backgroundBufferingRef.current = false;
-      if (preparingBookRef.current?.id === book.id) preparingBookRef.current = null;
-    }
-  }
 
   const openDocument = async () => {
     try {
@@ -617,10 +347,9 @@ function App() {
       const parsed = splitSentences(doc.text);
       if (!parsed.length) throw new Error('No readable sentences found in this document');
       playTokenRef.current++;
-      await KokoroTts.stop();
-      await KokoroTts.stopPlaybackSession();
+      await SystemTts.stop();
+      await SystemTts.stopPlaybackSession();
       clearWordProgress();
-      backgroundBufferingRef.current = false;
       const book = await DocumentReader.saveLibraryDocument(
         doc.title,
         doc.kind,
@@ -637,9 +366,8 @@ function App() {
       setCurrent(0);
       setLastResult(null);
       setView('reader');
-      setStatus(`${doc.kind.toUpperCase()} added: ${parsed.length} sentences · caching in background`);
+      setStatus(`${doc.kind.toUpperCase()} added · ready to read`);
       recordLog(`ui document loaded title=${doc.title} kind=${doc.kind} sentences=${parsed.length}`);
-      startDocumentPreparation(parsed, book, 0);
     } catch (error) {
       const message = describeError(error);
       if (message.includes('DOCUMENT_PICK_CANCELLED')) {
@@ -663,21 +391,18 @@ function App() {
       const parsed = splitSentences(loaded.text);
       if (!parsed.length) throw new Error('No readable sentences found in this book');
       playTokenRef.current++;
-      await KokoroTts.stop();
-      await KokoroTts.stopPlaybackSession();
+      await SystemTts.stop();
+      await SystemTts.stopPlaybackSession();
       clearWordProgress();
-      backgroundBufferingRef.current = false;
       setPlaying(false);
       setActiveBookId(loaded.id);
       setDocumentTitle(loaded.title);
       setDocumentKind(loaded.kind);
       setSentences(parsed);
-      const startIndex = Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0));
-      setCurrent(startIndex);
+      setCurrent(Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0)));
       setLastResult(null);
       setView('reader');
-      setStatus(`Ready · ${loaded.cacheStatus === 'ready' ? 'cached audio available' : 'caching continues in background'}`);
-      startDocumentPreparation(parsed, loaded, startIndex);
+      setStatus('Ready to read');
     } catch (error) {
       Alert.alert('Could not open book', describeError(error));
       setStatus('Book open failed');
@@ -693,8 +418,8 @@ function App() {
       setLibrary(items => items.filter(item => item.id !== book.id));
       if (activeBookId === book.id) {
         playTokenRef.current++;
-        await KokoroTts.stop();
-        await KokoroTts.stopPlaybackSession();
+        await SystemTts.stop();
+        await SystemTts.stopPlaybackSession();
         clearWordProgress();
         setActiveBookId(null);
         setSentences([]);
@@ -716,14 +441,7 @@ function App() {
     try {
       void requestBackgroundPermission();
       await ensureReady();
-      if (backgroundBufferingRef.current) {
-        recordLog(`ui foreground play preempting background prebuffer start=${startIndex}`);
-        backgroundBufferingRef.current = false;
-      }
-      await prebufferFrom(startIndex, INITIAL_BUFFER_SECONDS, true);
-      if (token !== playTokenRef.current) return;
-      await KokoroTts.startPlaybackSession();
-      startBackgroundBuffer(startIndex + 1);
+      await SystemTts.startPlaybackSession();
       for (let index = startIndex; index < sentences.length; index++) {
         if (token !== playTokenRef.current) return;
         const sentence = sentences[index];
@@ -734,27 +452,25 @@ function App() {
             .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
         }
         setActiveWordCount(0);
-        setStatus(`Reading ${index + 1} of ${sentences.length} · caching ahead`);
+        setStatus(`Reading ${index + 1} of ${sentences.length}`);
         recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
-        const nextSentence = sentences[index + 1]?.text ?? '';
-        const result = await KokoroTts.speak(sentence.text, speakerId, speed, nextSentence);
+        const result = await SystemTts.speak(sentence.text, selectedVoice, speed);
         if (token !== playTokenRef.current) return;
         setLastResult(result);
         recordLog(
-          `ui sentence done index=${index} generation=${result.elapsedSeconds.toFixed(3)}s audio=${result.audioDurationSeconds.toFixed(3)}s rtf=${result.rtf.toFixed(3)} cached=${Boolean(result.cached)}`,
+          `ui sentence done index=${index} audio=${result.audioDurationSeconds.toFixed(3)}s source=${result.source ?? 'system'}`,
         );
-        startBackgroundBuffer(index + 2);
       }
       setStatus('Finished');
       setPlaying(false);
       clearWordProgress();
-      await KokoroTts.stopPlaybackSession();
+      await SystemTts.stopPlaybackSession();
     } catch (error) {
       const message = describeError(error);
       setStatus('Playback failed');
       setPlaying(false);
       clearWordProgress();
-      await KokoroTts.stopPlaybackSession().catch(() => {});
+      await SystemTts.stopPlaybackSession().catch(() => {});
       Alert.alert('Playback failed', message);
       recordLog(`ui playback failed ${message}`);
     } finally {
@@ -771,17 +487,10 @@ function App() {
       playTokenRef.current++;
       setPlaying(false);
       setBusy(false);
-      await KokoroTts.stop();
-      await KokoroTts.stopPlaybackSession();
+      await SystemTts.stop();
+      await SystemTts.stopPlaybackSession();
       clearWordProgress();
-      backgroundBufferingRef.current = false;
-      setStatus('Paused · caching continues');
-      if (activeBookId) {
-        const activeBook = library.find(item => item.id === activeBookId);
-        if (activeBook) {
-          startDocumentPreparation(sentences, activeBook, current);
-        }
-      }
+      setStatus('Paused');
       return;
     }
     recordLog(`ui play pressed current=${current}`);
@@ -793,9 +502,8 @@ function App() {
     const shouldResume = playing;
     recordLog(`ui skip ${current}->${bounded} resume=${shouldResume}`);
     playTokenRef.current++;
-    await KokoroTts.stop();
+    await SystemTts.stop();
     clearWordProgress();
-    backgroundBufferingRef.current = false;
     setCurrent(bounded);
     if (activeBookId) {
       void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: bounded})
@@ -807,15 +515,28 @@ function App() {
     if (shouldResume) {
       void speakAt(bounded);
     } else {
-      await KokoroTts.stopPlaybackSession();
+      await SystemTts.stopPlaybackSession();
       setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
     }
   };
 
+  useEffect(() => {
+    commandHandlerRef.current = command => {
+      if (command === 'pause') {
+        void playPause();
+      } else if (command === 'previous') {
+        void skipTo(current - 1);
+      } else if (command === 'next') {
+        void skipTo(current + 1);
+      }
+    };
+    timingHandlerRef.current = startWordProgress;
+  });
+
   const exportLogs = async () => {
     try {
       recordLog('ui export logs pressed');
-      await KokoroTts.exportLogs();
+      await SystemTts.exportLogs();
     } catch (error) {
       Alert.alert('Could not export logs', describeError(error));
     }
@@ -846,54 +567,37 @@ function App() {
       ? Math.max(0, Math.min(100, Math.round(((book.lastPosition + 1) / book.sentenceCount) * 100)))
       : 0;
 
-  const renderBookItem = ({item}: {item: LibraryBook}) => {
-    const cached = item.cacheStatus === 'ready';
-    const cacheProgress = bookCachePercent(item);
-    return (
-      <Pressable style={styles.bookRow} onPress={() => openLibraryBook(item)}>
-        <View style={styles.bookCover}>
-          <Text style={styles.bookCoverText}>{item.kind.toUpperCase()}</Text>
+  const renderBookItem = ({item}: {item: LibraryBook}) => (
+    <Pressable style={styles.bookRow} onPress={() => openLibraryBook(item)}>
+      <View style={styles.bookCover}>
+        <Text style={styles.bookCoverText}>{item.kind.toUpperCase()}</Text>
+      </View>
+      <View style={styles.bookInfo}>
+        <Text style={styles.bookTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+        <Text style={styles.bookMeta} numberOfLines={1}>
+          {item.sentenceCount} sections · {bookProgress(item)}% read
+        </Text>
+        <View style={styles.bookProgressTrack}>
+          <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
         </View>
-        <View style={styles.bookInfo}>
-          <Text style={styles.bookTitle} numberOfLines={2}>
-            {item.title}
-          </Text>
-          <Text style={styles.bookMeta} numberOfLines={1}>
-            {item.sentenceCount} sentences · {bookProgress(item)}% read
-          </Text>
-          <View style={styles.bookProgressTrack}>
-            <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
-          </View>
-          <Text style={[styles.cachePill, cached && styles.cachePillReady]} numberOfLines={1}>
-            {cached
-              ? 'Cached 100%'
-              : item.cacheStatus === 'preparing'
-                ? `Caching ${cacheProgress}%`
-                : `Cache ${cacheProgress}%`}
-          </Text>
-          <Pressable
-            style={[styles.smallActionButton, (busy || playing || backgroundBufferingRef.current) && styles.disabled]}
-            onPress={event => {
-              event.stopPropagation();
-              void generateFullAudiobook(item);
-            }}
-            disabled={busy || playing || backgroundBufferingRef.current}>
-            <Text style={styles.smallActionText}>Generate Audiobook</Text>
-          </Pressable>
-        </View>
-        <Pressable
-          style={styles.deleteButton}
-          onPress={event => {
-            event.stopPropagation();
-            void deleteBook(item);
-          }}
-          disabled={busy || playing}
-          hitSlop={10}>
-          <Text style={styles.deleteButtonText}>×</Text>
-        </Pressable>
+        <Text style={styles.localPill} numberOfLines={1}>
+          Local system voice
+        </Text>
+      </View>
+      <Pressable
+        style={styles.deleteButton}
+        onPress={event => {
+          event.stopPropagation();
+          void deleteBook(item);
+        }}
+        disabled={busy || playing}
+        hitSlop={10}>
+        <Text style={styles.deleteButtonText}>x</Text>
       </Pressable>
-    );
-  };
+    </Pressable>
+  );
 
   const handleScrollToIndexFailed = (info: {
     index: number;
@@ -912,19 +616,6 @@ function App() {
       });
     }, 100);
   };
-
-  useEffect(() => {
-    commandHandlerRef.current = command => {
-      if (command === 'pause') {
-        void playPause();
-      } else if (command === 'previous') {
-        void skipTo(current - 1);
-      } else if (command === 'next') {
-        void skipTo(current + 1);
-      }
-    };
-    timingHandlerRef.current = startWordProgress;
-  });
 
   if (view === 'library') {
     return (
@@ -958,7 +649,7 @@ function App() {
 
         <View style={styles.libraryFooter}>
           <Text style={styles.status} numberOfLines={2}>
-            {cacheStatus || status}
+            {status}
           </Text>
           <Pressable style={styles.logButtonWide} onPress={exportLogs}>
             <Text style={styles.logButtonText}>Export Logs</Text>
@@ -980,7 +671,7 @@ function App() {
             {documentTitle || 'Reader'}
           </Text>
           <Text style={styles.subtitle} numberOfLines={1}>
-            {documentKind.toUpperCase()} · {sentences.length} sentences
+            {documentKind.toUpperCase()} · {sentences.length} sections
           </Text>
         </View>
         <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
@@ -998,8 +689,8 @@ function App() {
         keyExtractor={item => String(item.id)}
         renderItem={renderSentenceItem}
         contentContainerStyle={styles.readerContent}
-        initialNumToRender={18}
-        maxToRenderPerBatch={12}
+        initialNumToRender={20}
+        maxToRenderPerBatch={14}
         windowSize={9}
         removeClippedSubviews
         onScrollToIndexFailed={handleScrollToIndexFailed}
@@ -1009,11 +700,6 @@ function App() {
         <Text style={styles.status} numberOfLines={2}>
           {status}
         </Text>
-        {cacheStatus ? (
-          <Text style={styles.cacheStatus} numberOfLines={1}>
-            {cacheStatus}
-          </Text>
-        ) : null}
 
         <View style={styles.controls}>
           <Pressable
@@ -1026,7 +712,7 @@ function App() {
             style={[styles.playButton, busy && !playing && styles.disabled]}
             onPress={playPause}
             disabled={busy && !playing}>
-            <Text style={styles.playButtonText}>{playing ? 'Pause' : ready ? 'Play' : 'Load & Play'}</Text>
+            <Text style={styles.playButtonText}>{playing ? 'Pause' : 'Play'}</Text>
           </Pressable>
           <Pressable
             style={styles.iconButton}
@@ -1040,11 +726,15 @@ function App() {
           <View style={styles.optionBox}>
             <Text style={styles.optionLabel}>Voice</Text>
             <View style={styles.stepperRow}>
-              <Pressable onPress={() => setSpeakerId(Math.max(0, speakerId - 1))} disabled={playing}>
+              <Pressable onPress={() => setVoiceIndex(Math.max(0, voiceIndex - 1))} disabled={playing || voices.length < 2}>
                 <Text style={styles.stepperText}>-</Text>
               </Pressable>
-              <Text style={styles.optionValue}>{VOICES[speakerId] ?? speakerId}</Text>
-              <Pressable onPress={() => setSpeakerId(Math.min(10, speakerId + 1))} disabled={playing}>
+              <Text style={styles.optionValue} numberOfLines={1}>
+                {voices[voiceIndex]?.locale ?? 'System'}
+              </Text>
+              <Pressable
+                onPress={() => setVoiceIndex(Math.min(Math.max(0, voices.length - 1), voiceIndex + 1))}
+                disabled={playing || voices.length < 2}>
                 <Text style={styles.stepperText}>+</Text>
               </Pressable>
             </View>
@@ -1059,7 +749,7 @@ function App() {
               </Pressable>
               <Text style={styles.optionValue}>{speed.toFixed(1)}x</Text>
               <Pressable
-                onPress={() => setSpeed(Math.min(1.5, Number((speed + 0.1).toFixed(1))))}
+                onPress={() => setSpeed(Math.min(1.8, Number((speed + 0.1).toFixed(1))))}
                 disabled={playing}>
                 <Text style={styles.stepperText}>+</Text>
               </Pressable>
@@ -1072,7 +762,7 @@ function App() {
 
         <Text style={styles.meta}>
           {sentences.length ? `${current + 1}/${sentences.length}` : '0/0'}
-          {lastResult ? ` · RTF ${lastResult.rtf.toFixed(2)} · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
+          {lastResult ? ` · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
         </Text>
       </View>
     </SafeAreaView>
@@ -1132,19 +822,6 @@ function makeStyles(colors: typeof lightColors) {
       backgroundColor: colors.surface,
       borderBottomColor: colors.border,
       borderBottomWidth: 1,
-    },
-    logo: {
-      width: 42,
-      height: 42,
-      borderRadius: 10,
-      backgroundColor: colors.accent,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    logoText: {
-      color: colors.accentText,
-      fontWeight: '800',
-      fontSize: 16,
     },
     headerText: {
       flex: 1,
@@ -1241,35 +918,15 @@ function makeStyles(colors: typeof lightColors) {
       height: 5,
       backgroundColor: colors.accent2,
     },
-    cachePill: {
+    localPill: {
       alignSelf: 'flex-start',
       maxWidth: '100%',
-      color: colors.muted,
-      borderColor: colors.border,
+      color: colors.accent,
+      borderColor: colors.accent,
       borderWidth: 1,
       borderRadius: 6,
       paddingHorizontal: 8,
       paddingVertical: 3,
-      fontSize: 11,
-      fontWeight: '800',
-    },
-    cachePillReady: {
-      color: colors.accent,
-      borderColor: colors.accent,
-    },
-    smallActionButton: {
-      alignSelf: 'flex-start',
-      minHeight: 30,
-      borderRadius: 6,
-      paddingHorizontal: 9,
-      paddingVertical: 5,
-      backgroundColor: colors.surface2,
-      borderColor: colors.border,
-      borderWidth: 1,
-      justifyContent: 'center',
-    },
-    smallActionText: {
-      color: colors.text,
       fontSize: 11,
       fontWeight: '800',
     },
@@ -1283,8 +940,8 @@ function makeStyles(colors: typeof lightColors) {
     },
     deleteButtonText: {
       color: colors.muted,
-      fontSize: 24,
-      lineHeight: 26,
+      fontSize: 22,
+      lineHeight: 24,
       fontWeight: '700',
     },
     emptyState: {
@@ -1329,7 +986,7 @@ function makeStyles(colors: typeof lightColors) {
     },
     readerContent: {
       padding: 22,
-      paddingBottom: 260,
+      paddingBottom: 230,
       gap: 10,
     },
     sentence: {
@@ -1379,12 +1036,6 @@ function makeStyles(colors: typeof lightColors) {
       color: colors.text,
       fontSize: 14,
       textAlign: 'center',
-    },
-    cacheStatus: {
-      color: colors.muted,
-      fontSize: 12,
-      textAlign: 'center',
-      fontVariant: ['tabular-nums'],
     },
     controls: {
       flexDirection: 'row',
@@ -1448,47 +1099,50 @@ function makeStyles(colors: typeof lightColors) {
       textAlign: 'center',
     },
     stepperRow: {
+      minHeight: 28,
       flexDirection: 'row',
-      justifyContent: 'space-between',
       alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
     },
     stepperText: {
       color: colors.accent,
       fontSize: 22,
       fontWeight: '900',
-      paddingHorizontal: 6,
+      minWidth: 24,
+      textAlign: 'center',
     },
     logButton: {
-      width: 64,
+      width: 58,
+      borderRadius: 8,
+      backgroundColor: colors.surface2,
       borderColor: colors.border,
       borderWidth: 1,
-      borderRadius: 8,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: colors.bg,
     },
     logButtonWide: {
       minHeight: 42,
+      borderRadius: 8,
+      backgroundColor: colors.bg,
       borderColor: colors.border,
       borderWidth: 1,
-      borderRadius: 8,
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: colors.bg,
     },
     logButtonText: {
       color: colors.accent,
-      fontWeight: '800',
       fontSize: 13,
+      fontWeight: '800',
     },
     meta: {
       color: colors.muted,
-      fontSize: 12,
       textAlign: 'center',
+      fontSize: 12,
       fontVariant: ['tabular-nums'],
     },
     disabled: {
-      opacity: 0.5,
+      opacity: 0.45,
     },
   });
 }
