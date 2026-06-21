@@ -82,6 +82,7 @@ ipcMain.handle('start-generation', async (event, options) => {
   if (options.speed) args.push('--speed', String(options.speed))
   if (options.dtype) args.push('--dtype', options.dtype)
   if (options.device) args.push('--device', options.device)
+  if (options.concurrency) args.push('--concurrency', String(options.concurrency))
   if (options.limit) args.push('--limit', String(options.limit))
   if (options.dryRun) args.push('--dry-run')
 

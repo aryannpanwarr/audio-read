@@ -13,6 +13,7 @@ const els = {
   dtype: document.getElementById('dtype'),
   device: document.getElementById('device'),
   limit: document.getElementById('limit'),
+  concurrency: document.getElementById('concurrency'),
   dryRun: document.getElementById('dryRun'),
   start: document.getElementById('start'),
   cancel: document.getElementById('cancel'),
@@ -66,6 +67,7 @@ els.start.addEventListener('click', async () => {
     dtype: els.dtype.value,
     device: els.device.value,
     limit: els.limit.value,
+    concurrency: els.concurrency.value,
     dryRun: els.dryRun.checked,
   }
   setRunning(true)
@@ -153,8 +155,18 @@ function appendLog(text) {
 }
 
 function updateProgressFromLog(text) {
-  const segment = /\[(\d+)\/(\d+)\]/g
+  const completed = /\[done (\d+)\/(\d+)\]/g
   let match
+  let sawCompleted = false
+  while ((match = completed.exec(text))) {
+    sawCompleted = true
+    const done = Number(match[1])
+    const total = Number(match[2])
+    if (total > 0) els.progress.style.width = `${Math.max(0, Math.min(100, Math.round((done / total) * 100)))}%`
+  }
+  if (sawCompleted) return
+
+  const segment = /\[(\d+)\/(\d+)\]/g
   while ((match = segment.exec(text))) {
     const done = Number(match[1]) - 1
     const total = Number(match[2])

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process'
+import { execFileSync, fork } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, extname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { KokoroTTS } from 'kokoro-js'
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX'
@@ -10,6 +11,11 @@ const MAX_CHARS = 280
 const DEFAULT_PREVIEW_TEXT = 'This is a short voice preview from Audio Read.'
 
 const args = parseArgs(process.argv.slice(2))
+if (args.worker) {
+  await runWorker()
+  process.exit(0)
+}
+
 if ((!args.input && !args.previewVoice) || args.help) {
   printUsage()
   process.exit(args.help ? 0 : 1)
@@ -29,6 +35,7 @@ mkdirSync(outDir, { recursive: true })
 const voice = args.voice ?? DEFAULT_VOICE
 const speed = Number(args.speed ?? '1')
 const device = args.device ?? 'cpu'
+const concurrency = Math.max(1, Math.min(8, Number(args.concurrency ?? '1')))
 const limit = args.limit ? Math.max(1, Number(args.limit)) : null
 
 if (inputPath) console.log(`Input: ${inputPath}`)
@@ -36,6 +43,7 @@ console.log(`Output: ${outDir}`)
 console.log(`Voice: ${voice}`)
 console.log(`Speed: ${speed}`)
 console.log(`Device: ${device}`)
+if (!args.previewVoice) console.log(`Workers: ${concurrency}`)
 
 if (args.previewVoice) {
   console.log('Loading Kokoro...')
@@ -88,9 +96,6 @@ if (args.dryRun) {
   console.log(`Dry run written: ${join(outDir, 'dry-run.json')}`)
   process.exit(0)
 }
-console.log('Loading Kokoro...')
-const tts = await loadKokoro(args.dtype, device)
-
 const manifest = {
   version: 1,
   source: inputPath,
@@ -103,36 +108,25 @@ const manifest = {
   segments: [],
 }
 
-let cursor = 0
-for (let i = 0; i < segments.length; i++) {
-  const segment = segments[i]
-  const name = `${String(i + 1).padStart(4, '0')}.wav`
-  const audioPath = join(outDir, name)
-  const label = `${i + 1}/${segments.length}`
-  console.log(`[${label}] ${segment.text.slice(0, 80).replace(/\s+/g, ' ')}${segment.text.length > 80 ? '...' : ''}`)
-  const started = performance.now()
-  const audio = await tts.generate(segment.text, { voice, speed })
-  await audio.save(audioPath)
-  const duration = audio.audio.length / audio.sampling_rate
-  const elapsed = (performance.now() - started) / 1000
-  manifest.segments.push({
-    index: i,
-    section: segment.section,
-    audio: name,
-    text: segment.text,
-    start: round(cursor),
-    end: round(cursor + duration),
-    duration: round(duration),
-    sampleRate: audio.sampling_rate,
-    samples: audio.audio.length,
-    generationSeconds: round(elapsed),
+if (concurrency === 1) {
+  console.log('Loading Kokoro...')
+  const tts = await loadKokoro(args.dtype, device)
+  for (let i = 0; i < segments.length; i++) {
+    const result = await generateSegment(tts, segments[i], i, segments.length, outDir, voice, speed)
+    manifest.segments.push(result)
+    writeOrderedManifest(manifest, outDir, segments)
+  }
+} else {
+  await generateParallel(segments, manifest, outDir, {
+    voice,
+    speed,
+    dtype: args.dtype,
+    device,
+    concurrency,
   })
-  cursor += duration
-  writeFileSync(join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
 }
 
-manifest.duration = round(cursor)
-writeFileSync(join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
+writeOrderedManifest(manifest, outDir, segments)
 writeFileSync(join(outDir, 'transcript.txt'), segments.map((s) => s.text).join('\n\n'))
 console.log(`Done. Audio: ${outDir}`)
 console.log(`Manifest: ${join(outDir, 'manifest.json')}`)
@@ -148,8 +142,10 @@ function parseArgs(argv) {
     else if (arg === '--speed') out.speed = argv[++i]
     else if (arg === '--dtype') out.dtype = argv[++i]
     else if (arg === '--device') out.device = argv[++i]
+    else if (arg === '--concurrency' || arg === '--workers') out.concurrency = argv[++i]
     else if (arg === '--limit') out.limit = argv[++i]
     else if (arg === '--dry-run') out.dryRun = true
+    else if (arg === '--worker') out.worker = true
     else if (arg === '--preview-voice') out.previewVoice = true
     else if (arg === '--preview-text') out.previewText = argv[++i]
     else if (!out.input) out.input = arg
@@ -169,6 +165,7 @@ Options:
   --speed       Speech speed, default 1
   --dtype       q8, fp32, fp16, q4, q4f16; default q8
   --device      cpu or cuda; default cpu
+  --concurrency Number of Kokoro worker processes; default 1
   --limit       Generate only first N segments for a quick sample
   --dry-run     Extract/segment only; do not load Kokoro or generate audio
   --preview-voice Generate one short WAV sample for the selected voice
@@ -188,6 +185,144 @@ async function loadKokoro(dtype, device) {
   })
   process.stdout.write('\n')
   return tts
+}
+
+async function generateSegment(tts, segment, index, total, outputDir, voiceName, voiceSpeed) {
+  const name = `${String(index + 1).padStart(4, '0')}.wav`
+  const audioPath = join(outputDir, name)
+  const label = `${index + 1}/${total}`
+  console.log(`[${label}] ${segment.text.slice(0, 80).replace(/\s+/g, ' ')}${segment.text.length > 80 ? '...' : ''}`)
+  const started = performance.now()
+  const audio = await tts.generate(segment.text, { voice: voiceName, speed: voiceSpeed })
+  await audio.save(audioPath)
+  const duration = audio.audio.length / audio.sampling_rate
+  const elapsed = (performance.now() - started) / 1000
+  return {
+    index,
+    section: segment.section,
+    audio: name,
+    text: segment.text,
+    duration: round(duration),
+    sampleRate: audio.sampling_rate,
+    samples: audio.audio.length,
+    generationSeconds: round(elapsed),
+  }
+}
+
+async function generateParallel(segmentsToGenerate, manifest, outputDir, options) {
+  const workerCount = Math.min(options.concurrency, segmentsToGenerate.length)
+  console.log(`Starting ${workerCount} Kokoro workers...`)
+  const workers = []
+  let nextIndex = 0
+  let completed = 0
+  const closingWorkers = new WeakSet()
+
+  await new Promise((resolvePromise, rejectPromise) => {
+    const fail = error => {
+      workers.forEach(worker => worker.kill())
+      rejectPromise(error)
+    }
+
+    const assign = worker => {
+      if (nextIndex >= segmentsToGenerate.length) {
+        closingWorkers.add(worker)
+        worker.send({ type: 'close' })
+        return
+      }
+      const index = nextIndex++
+      worker.send({ type: 'segment', index, total: segmentsToGenerate.length, segment: segmentsToGenerate[index] })
+    }
+
+    for (let id = 0; id < workerCount; id++) {
+      const worker = fork(fileURLToPath(import.meta.url), ['--worker'], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      })
+      workers.push(worker)
+      worker.on('message', message => {
+        if (message.type === 'ready') {
+          assign(worker)
+        } else if (message.type === 'done') {
+          completed += 1
+          manifest.segments.push(message.result)
+          writeOrderedManifest(manifest, outputDir, segmentsToGenerate)
+          console.log(
+            `[done ${completed}/${segmentsToGenerate.length}] ${String(message.result.index + 1).padStart(4, '0')} ` +
+              `${message.result.duration}s audio in ${message.result.generationSeconds}s`,
+          )
+          assign(worker)
+          if (completed >= segmentsToGenerate.length) resolvePromise()
+        } else if (message.type === 'error') {
+          fail(new Error(message.error))
+        }
+      })
+      worker.on('error', fail)
+      worker.on('exit', code => {
+        if (!closingWorkers.has(worker) && completed < segmentsToGenerate.length) {
+          fail(new Error(`Worker exited with code ${code}`))
+        }
+      })
+      worker.send({
+        type: 'init',
+        outputDir,
+        voice: options.voice,
+        speed: options.speed,
+        dtype: options.dtype,
+        device: options.device,
+      })
+    }
+  })
+}
+
+async function runWorker() {
+  let tts = null
+  let config = null
+  return new Promise(resolvePromise => {
+    process.on('message', async message => {
+      try {
+        if (message.type === 'init') {
+          config = message
+          tts = await loadKokoro(config.dtype, config.device)
+          process.send?.({ type: 'ready' })
+        } else if (message.type === 'segment') {
+          if (!tts || !config) throw new Error('Worker not initialized')
+          const result = await generateSegment(
+            tts,
+            message.segment,
+            message.index,
+            message.total,
+            config.outputDir,
+            config.voice,
+            config.speed,
+          )
+          process.send?.({ type: 'done', result })
+        } else if (message.type === 'close') {
+          resolvePromise()
+        }
+      } catch (error) {
+        process.send?.({ type: 'error', error: error instanceof Error ? error.stack ?? error.message : String(error) })
+      }
+    })
+  })
+}
+
+function writeOrderedManifest(manifest, outputDir, sourceSegments) {
+  const generated = [...manifest.segments].sort((a, b) => a.index - b.index)
+  let cursor = 0
+  manifest.segments = generated.map(segment => {
+    const start = cursor
+    cursor += segment.duration
+    return {
+      ...segment,
+      text: sourceSegments[segment.index]?.text ?? segment.text,
+      start: round(start),
+      end: round(cursor),
+    }
+  })
+  manifest.generatedSegments = manifest.segments.length
+  manifest.totalSegments = sourceSegments.length
+  manifest.duration = round(cursor)
+  writeFileSync(join(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
 }
 
 async function extractSections(filePath) {
