@@ -25,10 +25,11 @@ type VoicePickerProps = {
     accentText: string;
   };
   onSelect: (index: number) => void;
+  onPreview: (voice: TtsVoice) => void;
   onClose: () => void;
 };
 
-function VoicePicker({visible, voices, selectedIndex, colors, onSelect, onClose}: VoicePickerProps) {
+function VoicePicker({visible, voices, selectedIndex, colors, onSelect, onPreview, onClose}: VoicePickerProps) {
   const styles = makeStyles(colors);
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -63,6 +64,15 @@ function VoicePicker({visible, voices, selectedIndex, colors, onSelect, onClose}
                       {item.requiresNetwork ? ' · online' : ' · offline'}
                     </Text>
                   </View>
+                  <Pressable
+                    style={styles.previewButton}
+                    hitSlop={8}
+                    onPress={event => {
+                      event.stopPropagation();
+                      onPreview(item);
+                    }}>
+                    <Text style={styles.previewText}>▶ Preview</Text>
+                  </Pressable>
                   {selected ? <Text style={styles.check}>✓</Text> : null}
                 </Pressable>
               );
@@ -147,6 +157,17 @@ function makeStyles(colors: VoicePickerProps['colors']) {
       color: colors.muted,
       fontSize: 12,
       marginTop: 2,
+    },
+    previewButton: {
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+      borderRadius: 8,
+      backgroundColor: colors.surface2,
+    },
+    previewText: {
+      color: colors.accent,
+      fontSize: 12,
+      fontWeight: '800',
     },
     check: {
       color: colors.accent,

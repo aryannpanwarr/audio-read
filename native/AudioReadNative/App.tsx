@@ -132,6 +132,11 @@ const recordLog = (message: string) => {
   void SystemTts.record(message).catch(() => {});
 };
 
+// Module-level so it is shared across every render/closure (and any re-mounted App
+// instance). Any action that should stop playback bumps this; each speak loop captures
+// its value and exits the moment it no longer matches, guaranteeing a single live loop.
+let playGeneration = 0;
+
 const previousErrorHandler = global.ErrorUtils?.getGlobalHandler?.();
 global.ErrorUtils?.setGlobalHandler?.((error, isFatal) => {
   recordLog(`global-js-error fatal=${Boolean(isFatal)} ${describeError(error)}`);
@@ -233,7 +238,6 @@ function App() {
   const [chapters, setChapters] = useState<EpubChapter[]>([]);
   const [chapterIndex, setChapterIndex] = useState(0);
   const [pageCount, setPageCount] = useState(0);
-  const playTokenRef = useRef(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
   const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
@@ -303,15 +307,19 @@ function App() {
     }
   };
 
+  // Kept identity-stable (empty deps) via a ref so the mount effect below runs exactly
+  // once. When it depended on `ready`, flipping ready re-ran init/library side effects.
+  const readyDataRef = useRef<InitResult | null>(null);
   const ensureReady = useCallback(async () => {
-    if (ready) return ready;
+    if (readyDataRef.current) return readyDataRef.current;
     setStatus('Loading Android voice...');
     const info = await SystemTts.initialize();
+    readyDataRef.current = info;
     setReady(info);
     setVoiceIndex(Math.max(0, info.voices?.findIndex(voice => voice.locale.toLowerCase().startsWith('en')) ?? 0));
     setStatus(`System TTS ready${info.engine ? ` · ${info.engine}` : ''}`);
     return info;
-  }, [ready]);
+  }, []);
 
   useEffect(() => {
     recordLog('reader app mounted');
@@ -424,7 +432,7 @@ function App() {
   };
 
   const enterReader = async (book: LibraryBook, text: string) => {
-    playTokenRef.current++;
+    playGeneration++;
     await SystemTts.stop();
     await SystemTts.stopPlaybackSession();
     clearWordProgress();
@@ -514,7 +522,7 @@ function App() {
       await DocumentReader.deleteLibraryDocument(book.id);
       setLibrary(items => items.filter(item => item.id !== book.id));
       if (activeBookId === book.id) {
-        playTokenRef.current++;
+        playGeneration++;
         await SystemTts.stop();
         await SystemTts.stopPlaybackSession();
         clearWordProgress();
@@ -543,7 +551,7 @@ function App() {
 
   const speakAt = async (startIndex: number) => {
     if (!sentencesRef.current.length && documentKind !== 'epub') return;
-    const token = ++playTokenRef.current;
+    const token = ++playGeneration;
     setPlaying(true);
     setBusy(true);
     try {
@@ -564,18 +572,18 @@ function App() {
           sentencesResolveRef.current = finish;
           setTimeout(() => finish(sentencesRef.current), 8000);
         });
-        if (token !== playTokenRef.current) return;
+        if (token !== playGeneration) return;
       }
       let index = startIndex;
       while (true) {
-        if (token !== playTokenRef.current) return;
+        if (token !== playGeneration) return;
         const segment = sentencesRef.current;
         if (index >= segment.length) {
           // EPUB: advance to the next chapter and keep reading.
           if (documentKind === 'epub' && chapterIndexRef.current < chaptersRef.current.length - 1) {
             setStatus('Loading next chapter...');
             await loadChapterAndWait(chapterIndexRef.current + 1);
-            if (token !== playTokenRef.current) return;
+            if (token !== playGeneration) return;
             index = 0;
             setCurrent(0);
             continue;
@@ -594,7 +602,7 @@ function App() {
         setStatus(`Reading ${index + 1} of ${segment.length}`);
         recordLog(`ui reading sentence=${index} chars=${speakText.length}`);
         const result = await SystemTts.speak(speakText, selectedVoice, speed);
-        if (token !== playTokenRef.current) return;
+        if (token !== playGeneration) return;
         setLastResult(result);
         index += 1;
       }
@@ -611,7 +619,7 @@ function App() {
       Alert.alert('Playback failed', message);
       recordLog(`ui playback failed ${message}`);
     } finally {
-      if (token === playTokenRef.current) {
+      if (token === playGeneration) {
         setBusy(false);
       }
     }
@@ -621,7 +629,7 @@ function App() {
     if (busy && !playing) return;
     if (playing) {
       recordLog('ui pause pressed');
-      playTokenRef.current++;
+      playGeneration++;
       setPlaying(false);
       setBusy(false);
       await SystemTts.stop();
@@ -638,7 +646,7 @@ function App() {
     const bounded = Math.max(0, Math.min(sentences.length - 1, next));
     const shouldResume = playing;
     recordLog(`ui skip ${current}->${bounded} resume=${shouldResume}`);
-    playTokenRef.current++;
+    playGeneration++;
     await SystemTts.stop();
     clearWordProgress();
     setCurrent(bounded);
@@ -665,6 +673,21 @@ function App() {
     };
     timingHandlerRef.current = startWordProgress;
   });
+
+  const previewVoice = useCallback(async (voice: TtsVoice) => {
+    try {
+      await ensureReady();
+      await SystemTts.stop();
+      recordLog(`ui voice preview ${voice.name}`);
+      void SystemTts.speak(
+        'This is a preview of the selected reading voice.',
+        voice.name,
+        1,
+      ).catch(error => recordLog(`ui voice preview failed ${describeError(error)}`));
+    } catch (error) {
+      recordLog(`ui voice preview failed ${describeError(error)}`);
+    }
+  }, [ensureReady]);
 
   const handlePdfError = useCallback((message: string) => recordLog(`pdf view ${message}`), []);
   const handleEpubError = useCallback((message: string) => recordLog(`epub view ${message}`), []);
@@ -929,7 +952,11 @@ function App() {
         selectedIndex={voiceIndex}
         colors={colors}
         onSelect={setVoiceIndex}
-        onClose={() => setShowVoices(false)}
+        onPreview={previewVoice}
+        onClose={() => {
+          void SystemTts.stop();
+          setShowVoices(false);
+        }}
       />
     </SafeAreaView>
   );

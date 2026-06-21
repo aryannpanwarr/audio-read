@@ -29,17 +29,27 @@ const buildInjectedScript = (dark: boolean) => `
     function post(obj){ window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(obj)); }
     window.__arPost = post;
 
+    // EPUB XHTML usually has no mobile viewport, so the WebView renders it at a wide
+    // desktop width and shrinks it -> tiny text. Force a device-width viewport.
+    var vp = document.querySelector('meta[name="viewport"]');
+    if (!vp) { vp = document.createElement('meta'); vp.setAttribute('name','viewport'); document.head.appendChild(vp); }
+    vp.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=4');
+
     var style = document.createElement('style');
     style.textContent = ''
-      + 'html,body{margin:0;padding:18px 20px 160px;line-height:1.6;'
-      + 'font-size:19px;-webkit-text-size-adjust:100%;}'
-      + 'body{color:' + (${dark} ? "'#f4f6f2'" : "'#1d2423'") + ';'
-      + 'background:' + (${dark} ? "'#101312'" : "'#f6f7f4'") + ';}'
-      + 'img{max-width:100% !important;height:auto !important;}'
-      + 'a{color:' + (${dark} ? "'#2dd4bf'" : "'#0f766e'") + ';}'
-      + '.ar-s{transition:background-color .15s ease;}'
-      + '.ar-active{background:' + (${dark} ? "'#4a3d18'" : "'#fde68a'") + ';'
-      + 'color:' + (${dark} ? "'#fff'" : "'#1d2423'") + ';border-radius:4px;}';
+      + 'html{-webkit-text-size-adjust:100%;text-size-adjust:100%;}'
+      + 'html,body{margin:0 !important;padding:0 !important;}'
+      + 'body{padding:18px 20px 180px !important;line-height:1.65 !important;'
+      + 'font-size:1.15rem !important;max-width:100% !important;'
+      + 'color:' + (${dark} ? "'#f4f6f2'" : "'#1d2423'") + ' !important;'
+      + 'background:' + (${dark} ? "'#101312'" : "'#f6f7f4'") + ' !important;}'
+      + 'p,div,span,li,td,h1,h2,h3,h4,h5,h6,blockquote{max-width:100% !important;}'
+      + 'img,svg,image{max-width:100% !important;height:auto !important;}'
+      + 'a{color:' + (${dark} ? "'#2dd4bf'" : "'#0f766e'") + ' !important;}'
+      + '.ar-s{transition:background-color .12s ease;}'
+      + '.ar-active{background:' + (${dark} ? "'#7a5c12'" : "'#ffe08a'") + ' !important;'
+      + 'color:' + (${dark} ? "'#fff'" : "'#1d2423'") + ' !important;'
+      + 'border-radius:4px;box-shadow:0 0 0 2px ' + (${dark} ? "'#7a5c12'" : "'#ffe08a'") + ';}';
     document.head.appendChild(style);
 
     var skipTags = {SCRIPT:1, STYLE:1, HEAD:1, NOSCRIPT:1};
@@ -70,7 +80,9 @@ const buildInjectedScript = (dark: boolean) => `
         span.textContent = piece;
         frag.appendChild(span);
         curText += piece;
-        if (/[.!?]["')\\]]*\\s*$/.test(piece)) {
+        // Only finish a sentence at a terminator once we have a reasonable chunk,
+        // so very short fragments merge instead of producing choppy mini-utterances.
+        if (/[.!?]["')\\]]*\\s*$/.test(piece) && curText.trim().length >= 40) {
           sentences[curIdx] = curText.trim();
           curIdx++; curText = '';
         }
