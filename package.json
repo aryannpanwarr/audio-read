@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "audiobook": "node scripts/pc-audiobook.mjs"
   },
   "dependencies": {
     "kokoro-js": "^1.2.1",
