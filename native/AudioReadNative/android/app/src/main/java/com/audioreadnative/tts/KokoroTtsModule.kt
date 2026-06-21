@@ -185,14 +185,21 @@ class KokoroTtsModule(
   }
 
   @ReactMethod
-  fun prebuffer(texts: ReadableArray, speakerId: Int, speed: Double, targetAudioSeconds: Double, promise: Promise) {
+  fun prebuffer(
+    texts: ReadableArray,
+    speakerId: Int,
+    speed: Double,
+    targetAudioSeconds: Double,
+    requestId: String,
+    promise: Promise,
+  ) {
     val items = mutableListOf<String>()
     for (index in 0 until texts.size()) {
       texts.getString(index)?.trim()?.takeIf { it.isNotEmpty() }?.let { items.add(it) }
     }
     LogStore.write(
       TAG,
-      "prebuffer requested items=${items.size} targetAudio=${"%.1f".format(targetAudioSeconds)} speakerId=$speakerId speed=$speed",
+      "prebuffer requested request=$requestId items=${items.size} targetAudio=${"%.1f".format(targetAudioSeconds)} speakerId=$speakerId speed=$speed",
     )
     stopped = false
     val runEpoch = prebufferEpoch.incrementAndGet()
@@ -210,7 +217,7 @@ class KokoroTtsModule(
           if (cached != null) {
             cacheHits += 1
             generatedAudioSeconds += cached.audioDurationSeconds
-            emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+            emitPrebufferProgress(requestId, index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
             continue
           }
           val disk = loadDiskAudio(key)
@@ -220,7 +227,7 @@ class KokoroTtsModule(
             }
             cacheHits += 1
             generatedAudioSeconds += disk.audioDurationSeconds
-            emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+            emitPrebufferProgress(requestId, index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
             continue
           }
           val generated = synchronized(generationLock) {
@@ -237,14 +244,15 @@ class KokoroTtsModule(
             TAG,
             "prebuffer item=${index + 1}/${items.size} generation=${"%.3f".format(generated.generationSeconds)}s audio=${"%.3f".format(generated.audioDurationSeconds)}s totalAudio=${"%.3f".format(generatedAudioSeconds)}s cacheSeconds=${"%.3f".format(cachedAudioSeconds)}",
           )
-          emitPrebufferProgress(index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
+          emitPrebufferProgress(requestId, index + 1, items.size, generatedAudioSeconds, startedAt, cacheHits)
         }
         val elapsed = (System.nanoTime() - startedAt) / 1_000_000_000.0
         LogStore.write(
           TAG,
-          "prebuffer resolved generated=$generatedCount cacheHits=$cacheHits audio=${"%.3f".format(generatedAudioSeconds)}s elapsed=${"%.3f".format(elapsed)}s",
+          "prebuffer resolved request=$requestId generated=$generatedCount cacheHits=$cacheHits audio=${"%.3f".format(generatedAudioSeconds)}s elapsed=${"%.3f".format(elapsed)}s",
         )
         val map = Arguments.createMap().apply {
+          putString("requestId", requestId)
           putInt("generated", generatedCount)
           putInt("cacheHits", cacheHits)
           putDouble("audioDurationSeconds", generatedAudioSeconds)
@@ -477,6 +485,7 @@ class KokoroTtsModule(
   }
 
   private fun emitPrebufferProgress(
+    requestId: String,
     processed: Int,
     total: Int,
     audioSeconds: Double,
@@ -485,6 +494,7 @@ class KokoroTtsModule(
   ) {
     val elapsed = (System.nanoTime() - startedAt) / 1_000_000_000.0
     val map = Arguments.createMap().apply {
+      putString("requestId", requestId)
       putInt("processed", processed)
       putInt("total", total)
       putInt("cacheHits", cacheHits)

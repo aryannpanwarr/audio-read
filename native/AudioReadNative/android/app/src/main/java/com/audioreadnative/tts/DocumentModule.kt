@@ -271,8 +271,13 @@ class DocumentModule(
     val out = StringBuilder()
     htmlPaths.forEach { path ->
       val bytes = entries[path] ?: return@forEach
+      val text = bytes.toString(Charsets.UTF_8).htmlToText()
+      if (text.isLikelyEpubJunkPage()) {
+        LogStore.write(DOCUMENT_TAG, "epub skipped junk page path=$path chars=${text.length}")
+        return@forEach
+      }
       out.append('\n')
-      out.append(bytes.toString(Charsets.UTF_8).htmlToText())
+      out.append(text)
       out.append('\n')
     }
     LogStore.write(DOCUMENT_TAG, "epub extracted htmlFiles=${htmlPaths.size}")
@@ -313,7 +318,15 @@ class DocumentModule(
       val basePath = opfPath.substringBeforeLast('/', "")
       parsed.spine
         .mapNotNull { idRef -> parsed.manifest[idRef] }
-        .map { href -> joinEpubPath(basePath, href) }
+        .filterNot { item ->
+          val marker = "${item.id} ${item.href} ${item.properties}".lowercase(Locale.US)
+          marker.contains("cover") ||
+            marker.contains("nav") ||
+            marker.contains("svg") ||
+            item.id.equals("pg-header", ignoreCase = true) ||
+            item.id.equals("pg-footer", ignoreCase = true)
+        }
+        .map { item -> joinEpubPath(basePath, item.href) }
         .filter { path -> entries[path] != null && path.isHtmlPath() }
         .also { LogStore.write(DOCUMENT_TAG, "epub spine resolved count=${it.size}") }
     } catch (e: Throwable) {
@@ -334,7 +347,7 @@ class DocumentModule(
   }
 
   private fun parseOpf(xml: String): EpubOpf {
-    val manifest = linkedMapOf<String, String>()
+    val manifest = linkedMapOf<String, EpubManifestItem>()
     val spine = mutableListOf<String>()
     val parser = newXmlParser(xml)
     while (parser.eventType != XmlPullParser.END_DOCUMENT) {
@@ -343,7 +356,10 @@ class DocumentModule(
           "item" -> {
             val id = parser.getAttributeValue(null, "id")
             val href = parser.getAttributeValue(null, "href")
-            if (!id.isNullOrBlank() && !href.isNullOrBlank()) manifest[id] = href
+            val properties = parser.getAttributeValue(null, "properties").orEmpty()
+            if (!id.isNullOrBlank() && !href.isNullOrBlank()) {
+              manifest[id] = EpubManifestItem(id, href, properties)
+            }
           }
           "itemref" -> {
             val idRef = parser.getAttributeValue(null, "idref")
@@ -399,8 +415,14 @@ class DocumentModule(
   }
 }
 
+private data class EpubManifestItem(
+  val id: String,
+  val href: String,
+  val properties: String,
+)
+
 private data class EpubOpf(
-  val manifest: Map<String, String>,
+  val manifest: Map<String, EpubManifestItem>,
   val spine: List<String>,
 )
 
@@ -426,11 +448,20 @@ private fun android.content.ContentResolver.takePersistableUriPermissionSafe(uri
 }
 
 private fun String.htmlToText(): String = this
-  .replace(Regex("(?is)<(script|style|nav|head|metadata).*?</\\1>"), " ")
+  .replace(Regex("(?is)<(script|style|nav|head|metadata|svg).*?</\\1>"), " ")
+  .replace(Regex("(?is)<header\\b[^>]*(?:pg-boilerplate|pgheader)[^>]*>.*?</header>"), " ")
+  .replace(Regex("(?is)<section\\b[^>]*(?:pg-boilerplate|pgheader|pg-footer)[^>]*>.*?</section>"), " ")
+  .replace(Regex("(?is)<footer\\b[^>]*>.*?</footer>"), " ")
+  .replace(Regex("(?is)<table\\b[^>]*>.*?</table>"), "\n")
+  .replace(Regex("(?is)<a\\b[^>]*(?:noteref|pagenum)[^>]*>.*?</a>"), " ")
+  .replace(Regex("(?is)<span\\b[^>]*(?:pagebreak|pagenum|linenum)[^>]*>.*?</span>"), " ")
+  .replace(Regex("(?is)<sup\\b[^>]*>.*?</sup>"), " ")
+  .replace(Regex("(?is)<hr\\b[^>]*>"), "\n\n")
+  .replace(Regex("(?is)<br\\s*/?>"), "\n")
+  .replace(Regex("(?is)</h[1-6]\\s*>"), "\n\n")
   .replace(Regex("(?is)<(h[1-6]|p|div|section|article|li|blockquote|tr)[^>]*>"), "\n")
   .replace(Regex("(?is)</(h[1-6]|p|div|section|article|li|blockquote|tr)\\s*>"), "\n")
-  .replace(Regex("(?is)<span[^>]*(pagebreak|pagenum)[^>]*>.*?</span>"), " ")
-  .replace(Regex("(?is)<br\\s*/?>"), "\n")
+  .replace(Regex("(?is)<a\\b[^>]*/>"), " ")
   .replace(Regex("(?is)<[^>]+>"), " ")
   .replace("&nbsp;", " ")
   .replace("&amp;", "&")
@@ -444,9 +475,24 @@ private fun String.normalizeDocumentText(): String = this
   .replace(Regex("[\\t\\x0B\\f\\r]+"), " ")
   .replace(Regex(" *\\n *"), "\n")
   .replace(Regex("(?m)^\\s*(page\\s*)?\\d{1,4}\\s*$", RegexOption.IGNORE_CASE), "")
+  .replace(Regex("(?m)^\\s*\\[(?:pg|page)\\s*\\d{1,4}]\\s*$", RegexOption.IGNORE_CASE), "")
+  .replace(Regex("(?m)^\\s*\\*{3}\\s*(?:START|END) OF THE PROJECT GUTENBERG EBOOK.*$"), "")
+  .replace(Regex("(?mi)^\\s*(?:produced by|transcribed from|updated editions will replace).*?$"), "")
   .replace(Regex("\\n{3,}"), "\n\n")
   .replace(Regex(" {2,}"), " ")
   .trim()
+
+private fun String.isLikelyEpubJunkPage(): Boolean {
+  val compact = replace(Regex("\\s+"), " ").trim()
+  if (compact.length < 20) return true
+  val lower = compact.lowercase(Locale.US)
+  if ("full project gutenberg license" in lower || "end of the project gutenberg ebook" in lower) return true
+  if ("the project gutenberg ebook of" in lower && compact.length < 900) return true
+  val lines = lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+  val first = lines.firstOrNull()?.lowercase(Locale.US).orEmpty()
+  if ((first == "contents" || first == "table of contents") && lines.size < 50) return true
+  return false
+}
 
 private fun String.decodeNumericEntities(): String =
   replace(Regex("&#(x?[0-9A-Fa-f]+);")) { match ->

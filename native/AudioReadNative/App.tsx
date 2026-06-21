@@ -61,6 +61,7 @@ type SpeechTiming = {
 };
 
 type PrebufferProgress = {
+  requestId?: string;
   processed: number;
   total: number;
   cacheHits: number;
@@ -69,6 +70,7 @@ type PrebufferProgress = {
 };
 
 type PrebufferResult = {
+  requestId?: string;
   generated: number;
   cacheHits: number;
   audioDurationSeconds: number;
@@ -83,6 +85,7 @@ type KokoroTtsModule = {
     speakerId: number,
     speed: number,
     targetAudioSeconds: number,
+    requestId: string,
   ): Promise<PrebufferResult>;
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
@@ -161,13 +164,54 @@ type Sentence = {
 };
 
 function splitSentences(text: string): Sentence[] {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  const parts = normalized.match(/[^.!?]+[.!?]+["')\]]?|[^.!?]+$/g) ?? [normalized];
-  return parts
-    .map(part => part.trim())
-    .filter(part => part.length > 0)
+  const paragraphs = text
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .split(/\n{2,}/)
+    .map(part => part.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim())
+    .filter(isReadableParagraph);
+  const rawParts = paragraphs.flatMap(paragraph => {
+    if (isHeading(paragraph)) return [paragraph];
+    return paragraph.match(/[^.!?]+(?:[.!?]+["')\]]+|[.!?]+)?|[^.!?]+$/g) ?? [paragraph];
+  });
+  return mergeSpeechParts(rawParts.map(part => part.trim()).filter(isReadableParagraph))
     .slice(0, 5000)
     .map((part, index) => ({id: index, text: part}));
+}
+
+function isReadableParagraph(text: string) {
+  if (text.length < 2) return false;
+  if (/^(?:page\s*)?\d{1,4}$/i.test(text)) return false;
+  if (/^\[?(?:pg|page)\s*\d{1,4}\]?$/i.test(text)) return false;
+  if (/^(?:chapter|part|book)\s+[ivxlcdm\d]+\.?$/i.test(text) && text.length < 18) return true;
+  return /[A-Za-z0-9]/.test(text);
+}
+
+function isHeading(text: string) {
+  if (text.length > 110) return false;
+  return /^(chapter|part|book|volume)\b/i.test(text) || /^[A-Z0-9 ,.'"-]{8,}$/.test(text);
+}
+
+function mergeSpeechParts(parts: string[]) {
+  const merged: string[] = [];
+  let carry = '';
+  parts.forEach(part => {
+    const current = carry ? `${carry} ${part}`.trim() : part;
+    if (current.length < 45 || isHeading(current)) {
+      carry = current;
+      return;
+    }
+    merged.push(current);
+    carry = '';
+  });
+  if (carry) {
+    if (merged.length && carry.length < 45) {
+      merged[merged.length - 1] = `${merged[merged.length - 1]} ${carry}`.trim();
+    } else {
+      merged.push(carry);
+    }
+  }
+  return merged.filter(part => part.length > 0);
 }
 
 function formatDuration(seconds: number) {
@@ -215,8 +259,16 @@ function App() {
   const currentRef = useRef(current);
   const backgroundBufferingRef = useRef(false);
   const visiblePrebufferRef = useRef(false);
+  const visiblePrebufferRequestRef = useRef<string | null>(null);
   const preparingBookRef = useRef<LibraryBook | null>(null);
+  const prebufferBooksRef = useRef<Record<string, string>>({});
+  const metadataUpdateRef = useRef<Record<string, number>>({});
+  const prebufferRequestCounterRef = useRef(0);
   const backgroundPermissionPromptedRef = useRef(false);
+
+  function updateBookInState(book: LibraryBook) {
+    setLibrary(items => [book, ...items.filter(item => item.id !== book.id)]);
+  }
 
   function clearWordProgress() {
     if (wordTimerRef.current) {
@@ -255,6 +307,7 @@ function App() {
       const items = await DocumentReader.listLibrary();
       setLibrary(items);
       recordLog(`ui library loaded count=${items.length}`);
+      void resumeLibraryPreparation(items);
     } catch (error) {
       recordLog(`ui library load failed ${describeError(error)}`);
     }
@@ -293,24 +346,36 @@ function App() {
     });
     const prebufferSubscription = emitter.addListener('AudioReadPrebufferProgress', progress => {
       const info = progress as PrebufferProgress;
-      const preparingBook = preparingBookRef.current;
-      if (visiblePrebufferRef.current) {
+      const requestId = info.requestId ?? '';
+      const bookId = prebufferBooksRef.current[requestId];
+      const isVisibleRequest = visiblePrebufferRef.current && visiblePrebufferRequestRef.current === requestId;
+      if (isVisibleRequest) {
         setStatus(
           `Preparing ${formatDuration(info.audioDurationSeconds)} audio · ${info.processed}/${info.total}`,
         );
-      } else if (preparingBook) {
+      } else if (bookId) {
         const cacheText = `${formatDuration(info.audioDurationSeconds)} cached · ${info.processed}/${info.total}`;
         setCacheStatus(cacheText);
         setLibrary(items =>
           items.map(item =>
-            item.id === preparingBook.id
+            item.id === bookId
               ? {...item, cacheStatus: 'preparing', preparedAudioSeconds: info.audioDurationSeconds}
               : item,
           ),
         );
+        const now = Date.now();
+        if (now - (metadataUpdateRef.current[bookId] ?? 0) > 5000) {
+          metadataUpdateRef.current[bookId] = now;
+          void DocumentReader.updateLibraryDocument(bookId, {
+            cacheStatus: 'preparing',
+            preparedAudioSeconds: info.audioDurationSeconds,
+          })
+            .then(updateBookInState)
+            .catch(error => recordLog(`ui cache progress metadata update failed ${describeError(error)}`));
+        }
       }
       recordLog(
-        `ui prebuffer progress processed=${info.processed}/${info.total} audio=${info.audioDurationSeconds.toFixed(3)}s elapsed=${info.elapsedSeconds.toFixed(3)}s cacheHits=${info.cacheHits}`,
+        `ui prebuffer progress request=${requestId || 'none'} processed=${info.processed}/${info.total} audio=${info.audioDurationSeconds.toFixed(3)}s elapsed=${info.elapsedSeconds.toFixed(3)}s cacheHits=${info.cacheHits}`,
       );
     });
     return () => {
@@ -350,14 +415,24 @@ function App() {
   const sentenceWindow = (startIndex: number) =>
     sentences.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
 
-  const prebufferTexts = async (texts: string[], targetSeconds: number, visible: boolean, label: string) => {
+  const prebufferTexts = async (
+    texts: string[],
+    targetSeconds: number,
+    visible: boolean,
+    label: string,
+    bookId?: string,
+  ) => {
     if (!texts.length) return null;
+    prebufferRequestCounterRef.current += 1;
+    const requestId = `pb-${prebufferRequestCounterRef.current}`;
     visiblePrebufferRef.current = visible;
+    if (visible) visiblePrebufferRequestRef.current = requestId;
+    if (bookId) prebufferBooksRef.current[requestId] = bookId;
     try {
       if (visible) setStatus('Preparing audio buffer...');
-      const result = await KokoroTts.prebuffer(texts, speakerId, speed, targetSeconds);
+      const result = await KokoroTts.prebuffer(texts, speakerId, speed, targetSeconds, requestId);
       recordLog(
-        `ui prebuffer done label=${label} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
+        `ui prebuffer done request=${requestId} label=${label} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
       );
       if (visible) {
         setStatus(
@@ -370,12 +445,20 @@ function App() {
     } finally {
       if (visible) {
         visiblePrebufferRef.current = false;
+        if (visiblePrebufferRequestRef.current === requestId) visiblePrebufferRequestRef.current = null;
       }
+      delete prebufferBooksRef.current[requestId];
     }
   };
 
   const prebufferFrom = async (startIndex: number, targetSeconds: number, visible: boolean) =>
-    prebufferTexts(sentenceWindow(startIndex), targetSeconds, visible, `start=${startIndex}`);
+    prebufferTexts(
+      sentenceWindow(startIndex),
+      targetSeconds,
+      visible,
+      `start=${startIndex}`,
+      activeBookId ?? undefined,
+    );
 
   const startBackgroundBuffer = (startIndex: number) => {
     if (backgroundBufferingRef.current) return;
@@ -393,11 +476,25 @@ function App() {
       });
   };
 
-  const updateBookInState = (book: LibraryBook) => {
-    setLibrary(items => [book, ...items.filter(item => item.id !== book.id)]);
-  };
+  async function resumeLibraryPreparation(items: LibraryBook[]) {
+    if (backgroundBufferingRef.current || playing || busy) return;
+    const book = items.find(
+      item => item.cacheStatus !== 'failed' && item.preparedAudioSeconds < LIBRARY_PREP_SECONDS,
+    );
+    if (!book) return;
+    try {
+      recordLog(`ui library resume prepare id=${book.id} title=${book.title}`);
+      const loaded = await DocumentReader.loadLibraryDocument(book.id);
+      const parsed = splitSentences(loaded.text);
+      if (!parsed.length) return;
+      const startIndex = Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0));
+      startDocumentPreparation(parsed, loaded, startIndex);
+    } catch (error) {
+      recordLog(`ui library resume prepare failed ${describeError(error)}`);
+    }
+  }
 
-  const startDocumentPreparation = (parsed: Sentence[], book: LibraryBook, startIndex = 0) => {
+  function startDocumentPreparation(parsed: Sentence[], book: LibraryBook, startIndex = 0) {
     const texts = parsed.slice(startIndex, startIndex + MAX_BUFFER_SENTENCES).map(sentence => sentence.text);
     if (!texts.length || backgroundBufferingRef.current) return;
     backgroundBufferingRef.current = true;
@@ -406,7 +503,7 @@ function App() {
     void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'preparing'}).then(updateBookInState).catch(() => {});
     recordLog(`ui library prepare started title=${book.title} start=${startIndex} sentences=${texts.length}`);
     void ensureReady()
-      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${book.title}`))
+      .then(() => prebufferTexts(texts, LIBRARY_PREP_SECONDS, false, `library=${book.title}`, book.id))
       .then(result => {
         if (!result) return;
         if (result.audioDurationSeconds < 1 && result.generated === 0 && result.cacheHits === 0) {
@@ -439,7 +536,7 @@ function App() {
           preparingBookRef.current = null;
         }
       });
-  };
+  }
 
   const openDocument = async () => {
     try {
