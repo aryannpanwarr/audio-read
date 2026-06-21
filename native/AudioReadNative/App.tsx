@@ -48,6 +48,7 @@ type LibraryBook = {
   updatedAt: number;
   lastPosition: number;
   preparedAudioSeconds: number;
+  cacheProgressPercent?: number;
   cacheStatus: string;
 };
 
@@ -168,10 +169,10 @@ function splitSentences(text: string): Sentence[] {
     .replace(/\r/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .split(/\n{2,}/)
-    .map(part => part.replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ').trim())
+    .map(part => part.replace(/\s{2,}/g, ' ').trim())
     .filter(isReadableParagraph);
   const rawParts = paragraphs.flatMap(paragraph => {
-    if (isHeading(paragraph)) return [paragraph];
+    if (isHeading(paragraph) || isContentsLine(paragraph)) return [paragraph];
     return paragraph.match(/[^.!?]+(?:[.!?]+["')\]]+|[.!?]+)?|[^.!?]+$/g) ?? [paragraph];
   });
   return mergeSpeechParts(rawParts.map(part => part.trim()).filter(isReadableParagraph))
@@ -192,12 +193,22 @@ function isHeading(text: string) {
   return /^(chapter|part|book|volume)\b/i.test(text) || /^[A-Z0-9 ,.'"-]{8,}$/.test(text);
 }
 
+function isContentsLine(text: string) {
+  return /^contents$/i.test(text) || /^(chapter|part)\s+[ivxlcdm\d]+\.?\s+.+/i.test(text);
+}
+
 function mergeSpeechParts(parts: string[]) {
   const merged: string[] = [];
   let carry = '';
   parts.forEach(part => {
     const current = carry ? `${carry} ${part}`.trim() : part;
-    if (current.length < 45 || isHeading(current)) {
+    if (isHeading(current) || isContentsLine(current)) {
+      if (carry && carry !== current) merged.push(carry);
+      merged.push(part);
+      carry = '';
+      return;
+    }
+    if (current.length < 45) {
       carry = current;
       return;
     }
@@ -219,6 +230,18 @@ function formatDuration(seconds: number) {
   const mins = Math.floor(seconds / 60);
   const secs = Math.round(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+function cachePercent(processed: number, total: number) {
+  if (!Number.isFinite(processed) || !Number.isFinite(total) || total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
+}
+
+function bookCachePercent(book: LibraryBook) {
+  if (Number.isFinite(book.cacheProgressPercent)) {
+    return Math.max(0, Math.min(100, Math.round(book.cacheProgressPercent ?? 0)));
+  }
+  return book.cacheStatus === 'ready' ? 100 : 0;
 }
 
 function splitWords(text: string) {
@@ -348,18 +371,24 @@ function App() {
       const info = progress as PrebufferProgress;
       const requestId = info.requestId ?? '';
       const bookId = prebufferBooksRef.current[requestId];
+      const percent = cachePercent(info.processed, info.total);
       const isVisibleRequest = visiblePrebufferRef.current && visiblePrebufferRequestRef.current === requestId;
       if (isVisibleRequest) {
         setStatus(
-          `Preparing ${formatDuration(info.audioDurationSeconds)} audio · ${info.processed}/${info.total}`,
+          `Preparing ${percent}% · ${formatDuration(info.audioDurationSeconds)} audio`,
         );
       } else if (bookId) {
-        const cacheText = `${formatDuration(info.audioDurationSeconds)} cached · ${info.processed}/${info.total}`;
+        const cacheText = `Caching ${percent}% · ${formatDuration(info.audioDurationSeconds)} audio`;
         setCacheStatus(cacheText);
         setLibrary(items =>
           items.map(item =>
             item.id === bookId
-              ? {...item, cacheStatus: 'preparing', preparedAudioSeconds: info.audioDurationSeconds}
+              ? {
+                  ...item,
+                  cacheStatus: 'preparing',
+                  preparedAudioSeconds: info.audioDurationSeconds,
+                  cacheProgressPercent: percent,
+                }
               : item,
           ),
         );
@@ -369,6 +398,7 @@ function App() {
           void DocumentReader.updateLibraryDocument(bookId, {
             cacheStatus: 'preparing',
             preparedAudioSeconds: info.audioDurationSeconds,
+            cacheProgressPercent: percent,
           })
             .then(updateBookInState)
             .catch(error => recordLog(`ui cache progress metadata update failed ${describeError(error)}`));
@@ -513,11 +543,13 @@ function App() {
         recordLog(
           `ui library prepare done title=${book.title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
         );
-        setCacheStatus(`${formatDuration(result.audioDurationSeconds)} cached`);
+        const percent = cachePercent(result.generated + result.cacheHits, texts.length);
+        setCacheStatus(`Cached ${percent}%`);
         const isReady = result.audioDurationSeconds >= LIBRARY_READY_SECONDS;
         void DocumentReader.updateLibraryDocument(book.id, {
           cacheStatus: isReady ? 'ready' : 'preparing',
           preparedAudioSeconds: result.audioDurationSeconds,
+          cacheProgressPercent: percent,
         })
           .then(updateBookInState)
           .catch(error => recordLog(`ui library prepare metadata update failed ${describeError(error)}`));
@@ -536,6 +568,44 @@ function App() {
           preparingBookRef.current = null;
         }
       });
+  }
+
+  async function generateFullAudiobook(book: LibraryBook) {
+    if (backgroundBufferingRef.current) {
+      setStatus('Caching already running');
+      return;
+    }
+    try {
+      setStatus('Preparing full audiobook...');
+      const loaded = await DocumentReader.loadLibraryDocument(book.id);
+      const parsed = splitSentences(loaded.text);
+      if (!parsed.length) throw new Error('No readable text found in this book');
+      backgroundBufferingRef.current = true;
+      preparingBookRef.current = loaded;
+      const texts = parsed.map(sentence => sentence.text);
+      recordLog(`ui full audiobook prepare started title=${loaded.title} sentences=${texts.length}`);
+      await ensureReady();
+      const result = await prebufferTexts(texts, 86_400, false, `full=${loaded.title}`, loaded.id);
+      if (!result) return;
+      const percent = cachePercent(result.generated + result.cacheHits, texts.length);
+      const done = percent >= 100;
+      setCacheStatus(done ? 'Audiobook cached 100%' : `Audiobook cached ${percent}%`);
+      await DocumentReader.updateLibraryDocument(loaded.id, {
+        cacheStatus: done ? 'ready' : 'preparing',
+        preparedAudioSeconds: result.audioDurationSeconds,
+        cacheProgressPercent: percent,
+      }).then(updateBookInState);
+      if (done) await KokoroTts.notifyPreparationDone(loaded.title, result.audioDurationSeconds);
+      recordLog(
+        `ui full audiobook prepare done title=${loaded.title} percent=${percent} audio=${result.audioDurationSeconds.toFixed(3)}s`,
+      );
+    } catch (error) {
+      recordLog(`ui full audiobook prepare failed ${describeError(error)}`);
+      Alert.alert('Could not generate audiobook', describeError(error));
+    } finally {
+      backgroundBufferingRef.current = false;
+      if (preparingBookRef.current?.id === book.id) preparingBookRef.current = null;
+    }
   }
 
   const openDocument = async () => {
@@ -778,6 +848,7 @@ function App() {
 
   const renderBookItem = ({item}: {item: LibraryBook}) => {
     const cached = item.cacheStatus === 'ready';
+    const cacheProgress = bookCachePercent(item);
     return (
       <Pressable style={styles.bookRow} onPress={() => openLibraryBook(item)}>
         <View style={styles.bookCover}>
@@ -795,11 +866,20 @@ function App() {
           </View>
           <Text style={[styles.cachePill, cached && styles.cachePillReady]} numberOfLines={1}>
             {cached
-              ? `${formatDuration(item.preparedAudioSeconds)} cached`
+              ? 'Cached 100%'
               : item.cacheStatus === 'preparing'
-                ? `Caching · ${formatDuration(item.preparedAudioSeconds)} cached`
-                : 'Cache pending'}
+                ? `Caching ${cacheProgress}%`
+                : `Cache ${cacheProgress}%`}
           </Text>
+          <Pressable
+            style={[styles.smallActionButton, (busy || playing || backgroundBufferingRef.current) && styles.disabled]}
+            onPress={event => {
+              event.stopPropagation();
+              void generateFullAudiobook(item);
+            }}
+            disabled={busy || playing || backgroundBufferingRef.current}>
+            <Text style={styles.smallActionText}>Generate Audiobook</Text>
+          </Pressable>
         </View>
         <Pressable
           style={styles.deleteButton}
@@ -1176,6 +1256,22 @@ function makeStyles(colors: typeof lightColors) {
     cachePillReady: {
       color: colors.accent,
       borderColor: colors.accent,
+    },
+    smallActionButton: {
+      alignSelf: 'flex-start',
+      minHeight: 30,
+      borderRadius: 6,
+      paddingHorizontal: 9,
+      paddingVertical: 5,
+      backgroundColor: colors.surface2,
+      borderColor: colors.border,
+      borderWidth: 1,
+      justifyContent: 'center',
+    },
+    smallActionText: {
+      color: colors.text,
+      fontSize: 11,
+      fontWeight: '800',
     },
     deleteButton: {
       width: 34,
