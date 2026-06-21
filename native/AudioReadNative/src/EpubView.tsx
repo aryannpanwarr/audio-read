@@ -9,7 +9,8 @@ const WebView = RNWebView as unknown as React.ComponentType<any>;
 type WebViewMessageEvent = {nativeEvent: {data: string}};
 
 type EpubViewProps = {
-  chapterUri: string;
+  html: string;
+  baseUrl: string;
   currentIndex: number;
   dark: boolean;
   bg: string;
@@ -98,15 +99,17 @@ const buildInjectedScript = (dark: boolean) => `
     for (var i = 0; i < curIdx; i++) { if (sentences[i] == null) sentences[i] = ''; }
 
     document.body.addEventListener('click', function(e){
+      // Prevent internal chapter links from navigating away from the combined doc.
       var t = e.target;
       while (t && t !== document.body) {
+        if (t.nodeName === 'A') { e.preventDefault(); }
         if (t.getAttribute && t.getAttribute('data-s') != null) {
           post({type:'tap', index: parseInt(t.getAttribute('data-s'), 10)});
           return;
         }
         t = t.parentNode;
       }
-    });
+    }, true);
 
     window.arHighlight = function(i){
       var prev = document.querySelector('.ar-active');
@@ -129,7 +132,8 @@ const buildInjectedScript = (dark: boolean) => `
 `;
 
 function EpubView({
-  chapterUri,
+  html,
+  baseUrl,
   currentIndex,
   dark,
   bg,
@@ -141,7 +145,7 @@ function EpubView({
   const readyRef = useRef(false);
   const injected = useMemo(() => buildInjectedScript(dark), [dark]);
 
-  // Re-highlight whenever the active sentence changes (and the chapter is ready).
+  // Re-highlight whenever the active sentence changes (and the book is ready).
   useEffect(() => {
     if (!readyRef.current) return;
     webRef.current?.injectJavaScript(
@@ -149,10 +153,10 @@ function EpubView({
     );
   }, [currentIndex]);
 
-  // Reset ready state when the chapter source changes.
+  // Reset ready state when the book content changes.
   useEffect(() => {
     readyRef.current = false;
-  }, [chapterUri]);
+  }, [html]);
 
   const handleMessage = useCallback(
     (event: WebViewMessageEvent) => {
@@ -186,7 +190,7 @@ function EpubView({
     <View style={[styles.container, {backgroundColor: bg}]}>
       <WebView
         ref={webRef}
-        source={{uri: chapterUri}}
+        source={{html, baseUrl}}
         originWhitelist={['*']}
         injectedJavaScript={injected}
         onMessage={handleMessage}

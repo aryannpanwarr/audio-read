@@ -284,6 +284,65 @@ class DocumentModule(
     }.start()
   }
 
+  /**
+   * Builds a single HTML document for the whole EPUB (all spine chapters concatenated)
+   * with every relative CSS/image URL rewritten to an absolute file:// path, so it can
+   * be shown as one continuous scroll in a WebView.
+   */
+  @ReactMethod
+  fun getEpubCombinedHtml(id: String, promise: Promise) {
+    Thread {
+      try {
+        val item = readLibraryIndex().firstOrNull { it.optString("id") == id }
+          ?: throw IllegalArgumentException("Book not found in library")
+        if (item.optString("kind") != "epub") throw IllegalStateException("Not an EPUB")
+        val dir = epubDir(id)
+        val spine = item.optJSONArray("spine")
+        if (!dir.exists() || spine == null || spine.length() == 0) {
+          throw IllegalStateException("EPUB render assets unavailable")
+        }
+        val styleLinks = LinkedHashSet<String>()
+        val inlineStyles = StringBuilder()
+        val body = StringBuilder()
+        for (i in 0 until spine.length()) {
+          val rel = spine.getString(i)
+          val file = File(dir, rel)
+          if (!file.exists()) continue
+          val chapterDir = rel.substringBeforeLast('/', "")
+          val raw = file.readText()
+          // Collect stylesheet links (rewritten to absolute) so shared CSS still applies.
+          Regex("(?is)<link\\b[^>]*rel=[\"']?stylesheet[\"']?[^>]*>").findAll(raw).forEach { m ->
+            val href = Regex("(?i)href=[\"']([^\"']+)[\"']").find(m.value)?.groupValues?.get(1)
+            if (!href.isNullOrBlank()) {
+              resolveEpubResource(dir, chapterDir, href)?.let { abs -> styleLinks.add(abs) }
+            }
+          }
+          Regex("(?is)<style\\b[^>]*>(.*?)</style>").findAll(raw).forEach { m ->
+            inlineStyles.append(rewriteCssUrls(dir, chapterDir, m.groupValues[1])).append('\n')
+          }
+          val bodyInner = Regex("(?is)<body\\b[^>]*>(.*?)</body>").find(raw)?.groupValues?.get(1) ?: raw
+          body.append("<section class=\"ar-chapter\" id=\"ar-ch-").append(i).append("\">")
+          body.append(rewriteHtmlUrls(dir, chapterDir, bodyInner))
+          body.append("</section>\n")
+        }
+        val head = StringBuilder()
+        head.append("<meta charset=\"utf-8\">")
+        head.append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=4\">")
+        styleLinks.forEach { href -> head.append("<link rel=\"stylesheet\" href=\"").append(href).append("\">") }
+        if (inlineStyles.isNotEmpty()) head.append("<style>").append(inlineStyles).append("</style>")
+        val html = "<!DOCTYPE html><html><head>$head</head><body>$body</body></html>"
+        LogStore.write(DOCUMENT_TAG, "epub combined html id=$id chapters=${spine.length()} bytes=${html.length}")
+        promise.resolve(Arguments.createMap().apply {
+          putString("html", html)
+          putString("baseUrl", Uri.fromFile(dir).toString() + "/")
+        })
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "getEpubCombinedHtml failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("EPUB_HTML_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
   /** Renders a single PDF page to a cached PNG and returns its path + pixel size. */
   @ReactMethod
   fun renderPdfPage(id: String, pageIndex: Int, targetWidth: Int, promise: Promise) {
@@ -694,6 +753,40 @@ private fun ZipEntry.isUsefulEpubEntry(): Boolean {
 private fun String.isHtmlPath(): Boolean {
   val lower = lowercase(Locale.US)
   return lower.endsWith(".xhtml") || lower.endsWith(".html") || lower.endsWith(".htm")
+}
+
+/** Resolves a chapter-relative resource to an absolute file:// URL, or null to leave it. */
+private fun resolveEpubResource(baseDir: File, chapterDir: String, rawValue: String): String? {
+  val value = rawValue.trim()
+  if (value.isEmpty()) return null
+  val lower = value.lowercase(Locale.US)
+  if (lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("data:") ||
+    lower.startsWith("file:") || lower.startsWith("mailto:") || lower.startsWith("tel:") ||
+    lower.startsWith("//") || value.startsWith("#")
+  ) {
+    return null
+  }
+  val joined = joinEpubPath(chapterDir, value)
+  if (joined.isBlank()) return null
+  return Uri.fromFile(File(baseDir, joined)).toString()
+}
+
+private fun rewriteHtmlUrls(baseDir: File, chapterDir: String, html: String): String {
+  val attrRegex = Regex("(?i)(src|href|xlink:href)(\\s*=\\s*)([\"'])(.*?)\\3")
+  val withAttrs = attrRegex.replace(html) { m ->
+    val resolved = resolveEpubResource(baseDir, chapterDir, m.groupValues[4])
+    if (resolved == null) m.value
+    else "${m.groupValues[1]}${m.groupValues[2]}${m.groupValues[3]}$resolved${m.groupValues[3]}"
+  }
+  return rewriteCssUrls(baseDir, chapterDir, withAttrs)
+}
+
+private fun rewriteCssUrls(baseDir: File, chapterDir: String, css: String): String {
+  val urlRegex = Regex("(?i)url\\(\\s*([\"']?)(.*?)\\1\\s*\\)")
+  return urlRegex.replace(css) { m ->
+    val resolved = resolveEpubResource(baseDir, chapterDir, m.groupValues[2])
+    if (resolved == null) m.value else "url(${m.groupValues[1]}$resolved${m.groupValues[1]})"
+  }
 }
 
 private fun joinEpubPath(basePath: String, href: String): String {

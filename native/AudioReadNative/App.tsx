@@ -104,6 +104,7 @@ type DocumentReaderModule = {
   updateLibraryDocument(id: string, patch: Partial<LibraryBook>): Promise<LibraryBook>;
   deleteLibraryDocument(id: string): Promise<void>;
   getBookManifest(id: string): Promise<BookManifest>;
+  getEpubCombinedHtml(id: string): Promise<{html: string; baseUrl: string}>;
 };
 
 const SystemTts = NativeModules.SystemTts as SystemTtsModule;
@@ -235,8 +236,8 @@ function App() {
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
   const [showVoices, setShowVoices] = useState(false);
-  const [chapters, setChapters] = useState<EpubChapter[]>([]);
-  const [chapterIndex, setChapterIndex] = useState(0);
+  const [epubHtml, setEpubHtml] = useState('');
+  const [epubBaseUrl, setEpubBaseUrl] = useState('');
   const [pageCount, setPageCount] = useState(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
@@ -245,8 +246,6 @@ function App() {
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
   const backgroundPermissionPromptedRef = useRef(false);
-  const chaptersRef = useRef(chapters);
-  const chapterIndexRef = useRef(chapterIndex);
   const sentencesResolveRef = useRef<((value: Sentence[]) => void) | null>(null);
 
   const voices = ready?.voices ?? [];
@@ -352,9 +351,7 @@ function App() {
   useEffect(() => {
     sentencesRef.current = sentences;
     currentRef.current = current;
-    chaptersRef.current = chapters;
-    chapterIndexRef.current = chapterIndex;
-  }, [sentences, current, chapters, chapterIndex]);
+  }, [sentences, current]);
 
   useEffect(() => {
     if (sentences.length) {
@@ -366,20 +363,14 @@ function App() {
     }
   }, [current, sentences.length]);
 
-  const withinChapter = sentences.length ? (current + 1) / sentences.length : 0;
-  const progress =
-    documentKind === 'epub' && chapters.length
-      ? Math.round(((chapterIndex + withinChapter) / chapters.length) * 100)
-      : sentences.length
-        ? Math.round(withinChapter * 100)
-        : 0;
+  const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
   const pdfCurrentPage =
     pageCount > 0 && sentences.length > 0
       ? Math.min(pageCount - 1, Math.floor((current / sentences.length) * pageCount))
       : 0;
 
-  // Called by the EPUB WebView once it has wrapped a chapter's text into sentence
-  // spans. This becomes the source of truth for TTS + highlighting in that chapter.
+  // Called by the EPUB WebView once it has wrapped the whole book's text into sentence
+  // spans. This is the single source of truth for TTS + highlighting.
   const handleEpubSentences = (list: string[]) => {
     const parsed = list.map((text, id) => ({id, text}));
     setSentences(parsed);
@@ -391,43 +382,16 @@ function App() {
     }
   };
 
-  const loadChapterAndWait = (index: number): Promise<Sentence[]> =>
-    new Promise(resolve => {
-      let settled = false;
-      const finish = (value: Sentence[]) => {
-        if (settled) return;
-        settled = true;
-        resolve(value);
-      };
-      sentencesResolveRef.current = finish;
-      setChapterIndex(index);
-      chapterIndexRef.current = index;
-      // Safety net in case the chapter has no readable text / fails to report.
-      setTimeout(() => finish(sentencesRef.current), 8000);
-    });
-
-  const loadManifest = async (book: LibraryBook) => {
-    setChapters([]);
-    setChapterIndex(0);
+  const loadPdfManifest = async (book: LibraryBook) => {
     setPageCount(0);
-    chaptersRef.current = [];
-    chapterIndexRef.current = 0;
-    if (book.kind !== 'epub' && book.kind !== 'pdf') return;
     try {
       const manifest = await DocumentReader.getBookManifest(book.id);
-      if (manifest.kind === 'epub' && manifest.chapters?.length) {
-        const startChapter = Math.max(0, Math.min(manifest.chapters.length - 1, book.lastChapter ?? 0));
-        setChapters(manifest.chapters);
-        chaptersRef.current = manifest.chapters;
-        setChapterIndex(startChapter);
-        chapterIndexRef.current = startChapter;
-        recordLog(`ui epub manifest chapters=${manifest.chapters.length} start=${startChapter}`);
-      } else if (manifest.kind === 'pdf' && manifest.pageCount) {
+      if (manifest.kind === 'pdf' && manifest.pageCount) {
         setPageCount(manifest.pageCount);
         recordLog(`ui pdf manifest pages=${manifest.pageCount}`);
       }
     } catch (error) {
-      recordLog(`ui manifest load failed ${describeError(error)}`);
+      recordLog(`ui pdf manifest load failed ${describeError(error)}`);
     }
   };
 
@@ -441,22 +405,29 @@ function App() {
     setDocumentTitle(book.title);
     setDocumentKind(book.kind);
     setLastResult(null);
+    setEpubHtml('');
+    setEpubBaseUrl('');
+    setPageCount(0);
     setView('reader');
     if (book.kind === 'epub') {
       setSentences([]);
       sentencesRef.current = [];
       setCurrent(Math.max(0, book.lastPosition || 0));
-      setStatus('Loading book layout...');
-      await loadManifest(book);
-      // Older books (saved before original-layout rendering) have no extracted
-      // chapter assets; fall back to the plain-text reader so they still work.
-      if (!chaptersRef.current.length) {
+      setStatus('Loading book...');
+      try {
+        const combined = await DocumentReader.getEpubCombinedHtml(book.id);
+        setEpubHtml(combined.html);
+        setEpubBaseUrl(combined.baseUrl);
+        recordLog(`ui epub combined html bytes=${combined.html.length}`);
+      } catch (error) {
+        // Older books (saved before original-layout rendering) have no assets;
+        // fall back to the plain-text reader so they still work.
         const parsed = splitSentences(text);
         setSentences(parsed);
         sentencesRef.current = parsed;
         setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
         setStatus('Ready to read');
-        recordLog('ui epub fallback to text reader (no render assets)');
+        recordLog(`ui epub fallback to text reader ${describeError(error)}`);
       }
     } else {
       const parsed = splitSentences(text);
@@ -464,7 +435,7 @@ function App() {
       sentencesRef.current = parsed;
       setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
       setStatus('Ready to read');
-      if (book.kind === 'pdf') await loadManifest(book);
+      if (book.kind === 'pdf') await loadPdfManifest(book);
     }
   };
 
@@ -528,7 +499,7 @@ function App() {
         clearWordProgress();
         setActiveBookId(null);
         setSentences([]);
-        setChapters([]);
+        setEpubHtml('');
         setPageCount(0);
         setCurrent(0);
         setPlaying(false);
@@ -542,9 +513,7 @@ function App() {
 
   const persistProgress = (index: number) => {
     if (!activeBookId) return;
-    const patch: Partial<LibraryBook> = {lastPosition: index};
-    if (documentKind === 'epub') patch.lastChapter = chapterIndexRef.current;
-    void DocumentReader.updateLibraryDocument(activeBookId, patch)
+    void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: index})
       .then(updateBookInState)
       .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
   };
@@ -558,10 +527,10 @@ function App() {
       void requestBackgroundPermission();
       await ensureReady();
       await SystemTts.startPlaybackSession();
-      // EPUB chapters report their sentences asynchronously from the WebView; wait for
-      // the current chapter before reading so we don't skip it.
+      // The EPUB WebView reports the whole book's sentences asynchronously; wait for
+      // them before reading so we don't start on an empty list.
       if (documentKind === 'epub' && !sentencesRef.current.length) {
-        setStatus('Preparing chapter...');
+        setStatus('Preparing book...');
         await new Promise<Sentence[]>(resolve => {
           let settled = false;
           const finish = (value: Sentence[]) => {
@@ -570,7 +539,7 @@ function App() {
             resolve(value);
           };
           sentencesResolveRef.current = finish;
-          setTimeout(() => finish(sentencesRef.current), 8000);
+          setTimeout(() => finish(sentencesRef.current), 12000);
         });
         if (token !== playGeneration) return;
       }
@@ -578,18 +547,7 @@ function App() {
       while (true) {
         if (token !== playGeneration) return;
         const segment = sentencesRef.current;
-        if (index >= segment.length) {
-          // EPUB: advance to the next chapter and keep reading.
-          if (documentKind === 'epub' && chapterIndexRef.current < chaptersRef.current.length - 1) {
-            setStatus('Loading next chapter...');
-            await loadChapterAndWait(chapterIndexRef.current + 1);
-            if (token !== playGeneration) return;
-            index = 0;
-            setCurrent(0);
-            continue;
-          }
-          break;
-        }
+        if (index >= segment.length) break;
         const sentence = segment[index];
         setCurrent(index);
         persistProgress(index);
@@ -843,9 +801,10 @@ function App() {
       </View>
 
       <View style={styles.readerBody}>
-        {documentKind === 'epub' && chapters.length ? (
+        {documentKind === 'epub' && epubHtml ? (
           <EpubView
-            chapterUri={chapters[chapterIndex].uri}
+            html={epubHtml}
+            baseUrl={epubBaseUrl}
             currentIndex={current}
             dark={dark}
             bg={colors.bg}
@@ -940,7 +899,6 @@ function App() {
         </View>
 
         <Text style={styles.meta}>
-          {documentKind === 'epub' && chapters.length ? `Ch ${chapterIndex + 1}/${chapters.length} · ` : ''}
           {sentences.length ? `${current + 1}/${sentences.length}` : '0/0'}
           {lastResult ? ` · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
         </Text>
