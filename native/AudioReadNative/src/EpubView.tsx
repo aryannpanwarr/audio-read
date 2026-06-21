@@ -35,21 +35,26 @@ const buildInjectedScript = (dark: boolean) => `
     if (!vp) { vp = document.createElement('meta'); vp.setAttribute('name','viewport'); document.head.appendChild(vp); }
     vp.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=4');
 
+    var FG = ${dark} ? '#f4f6f2' : '#1d2423';
+    var BG = ${dark} ? '#101312' : '#f6f7f4';
+    var LINK = ${dark} ? '#2dd4bf' : '#0f766e';
+    var HL_BG = ${dark} ? '#a87a14' : '#ffd24d';
+    var HL_FG = ${dark} ? '#0b0b0b' : '#1d2423';
     var style = document.createElement('style');
     style.textContent = ''
       + 'html{-webkit-text-size-adjust:100%;text-size-adjust:100%;}'
-      + 'html,body{margin:0 !important;padding:0 !important;}'
+      + 'html,body{margin:0 !important;padding:0 !important;background:' + BG + ' !important;}'
       + 'body{padding:18px 20px 180px !important;line-height:1.65 !important;'
-      + 'font-size:1.15rem !important;max-width:100% !important;'
-      + 'color:' + (${dark} ? "'#f4f6f2'" : "'#1d2423'") + ' !important;'
-      + 'background:' + (${dark} ? "'#101312'" : "'#f6f7f4'") + ' !important;}'
+      + 'font-size:1.15rem !important;max-width:100% !important;}'
+      // EPUB stylesheets set color/background directly on elements, so force readable
+      // high-contrast text on every element (the highlight class is excluded).
+      + 'body *:not(.ar-active){color:' + FG + ' !important;background-color:transparent !important;}'
       + 'p,div,span,li,td,h1,h2,h3,h4,h5,h6,blockquote{max-width:100% !important;}'
       + 'img,svg,image{max-width:100% !important;height:auto !important;}'
-      + 'a{color:' + (${dark} ? "'#2dd4bf'" : "'#0f766e'") + ' !important;}'
+      + 'a:not(.ar-active){color:' + LINK + ' !important;}'
       + '.ar-s{transition:background-color .12s ease;}'
-      + '.ar-active{background:' + (${dark} ? "'#7a5c12'" : "'#ffe08a'") + ' !important;'
-      + 'color:' + (${dark} ? "'#fff'" : "'#1d2423'") + ' !important;'
-      + 'border-radius:4px;box-shadow:0 0 0 2px ' + (${dark} ? "'#7a5c12'" : "'#ffe08a'") + ';}';
+      + '.ar-active{background:' + HL_BG + ' !important;color:' + HL_FG + ' !important;'
+      + 'border-radius:4px;box-shadow:0 0 0 3px ' + HL_BG + ' !important;}';
     document.head.appendChild(style);
 
     var skipTags = {SCRIPT:1, STYLE:1, HEAD:1, NOSCRIPT:1};

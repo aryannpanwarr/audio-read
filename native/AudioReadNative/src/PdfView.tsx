@@ -90,9 +90,14 @@ function PdfPage({
         {
           backgroundColor: colors.surface,
           borderColor: active ? colors.accent2 : colors.border,
-          borderWidth: active ? 2 : StyleSheet.hairlineWidth,
+          borderWidth: active ? 3 : StyleSheet.hairlineWidth,
         },
       ]}>
+      {active ? (
+        <View style={[styles.readingBadge, {backgroundColor: colors.accent2}]}>
+          <Text style={styles.readingBadgeText}>▶ Reading</Text>
+        </View>
+      ) : null}
       {page ? (
         <Image
           source={{uri: page.uri}}
@@ -142,6 +147,7 @@ function PdfView({bookId, pageCount, currentPage, colors, onSelectPage, onError}
     <FlatList
       ref={listRef}
       data={pages}
+      extraData={currentPage}
       keyExtractor={index => String(index)}
       style={{backgroundColor: colors.bg}}
       contentContainerStyle={styles.content}
@@ -192,6 +198,20 @@ const styles = StyleSheet.create({
     fontSize: 11,
     paddingVertical: 4,
     fontVariant: ['tabular-nums'],
+  },
+  readingBadge: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    zIndex: 2,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  readingBadgeText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '800',
   },
 });
 
