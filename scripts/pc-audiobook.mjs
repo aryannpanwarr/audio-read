@@ -7,30 +7,63 @@ import { KokoroTTS } from 'kokoro-js'
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX'
 const DEFAULT_VOICE = 'af_heart'
 const MAX_CHARS = 280
+const DEFAULT_PREVIEW_TEXT = 'This is a short voice preview from Audio Read.'
 
 const args = parseArgs(process.argv.slice(2))
-if (!args.input || args.help) {
+if ((!args.input && !args.previewVoice) || args.help) {
   printUsage()
   process.exit(args.help ? 0 : 1)
 }
 
-const inputPath = resolve(args.input)
-if (!existsSync(inputPath)) {
+const inputPath = args.input ? resolve(args.input) : null
+if (inputPath && !existsSync(inputPath)) {
   console.error(`Input file not found: ${inputPath}`)
   process.exit(1)
 }
 
-const outDir = resolve(args.out ?? join(process.cwd(), 'audiobook-output', safeBaseName(inputPath)))
+const outDir = resolve(
+  args.out ?? join(process.cwd(), 'audiobook-output', inputPath ? safeBaseName(inputPath) : 'voice-previews'),
+)
 mkdirSync(outDir, { recursive: true })
 
 const voice = args.voice ?? DEFAULT_VOICE
 const speed = Number(args.speed ?? '1')
 const limit = args.limit ? Math.max(1, Number(args.limit)) : null
 
-console.log(`Input: ${inputPath}`)
+if (inputPath) console.log(`Input: ${inputPath}`)
 console.log(`Output: ${outDir}`)
 console.log(`Voice: ${voice}`)
 console.log(`Speed: ${speed}`)
+
+if (args.previewVoice) {
+  console.log('Loading Kokoro...')
+  const tts = await loadKokoro(args.dtype)
+  const previewText = args.previewText ?? DEFAULT_PREVIEW_TEXT
+  const previewPath = join(outDir, `voice-preview-${safeName(voice)}.wav`)
+  console.log(`Preview text: ${previewText}`)
+  const started = performance.now()
+  const audio = await tts.generate(previewText, { voice, speed })
+  await audio.save(previewPath)
+  const duration = audio.audio.length / audio.sampling_rate
+  const elapsed = (performance.now() - started) / 1000
+  const manifest = {
+    version: 1,
+    type: 'voice-preview',
+    model: MODEL_ID,
+    voice,
+    speed,
+    text: previewText,
+    audio: basename(previewPath),
+    duration: round(duration),
+    sampleRate: audio.sampling_rate,
+    samples: audio.audio.length,
+    generationSeconds: round(elapsed),
+    generatedAt: new Date().toISOString(),
+  }
+  writeFileSync(join(outDir, `voice-preview-${safeName(voice)}.json`), JSON.stringify(manifest, null, 2))
+  console.log(`Preview: ${previewPath}`)
+  process.exit(0)
+}
 
 const sections = await extractSections(inputPath)
 const segments = makeSegments(sections).slice(0, limit ?? undefined)
@@ -54,17 +87,7 @@ if (args.dryRun) {
   process.exit(0)
 }
 console.log('Loading Kokoro...')
-const tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-  dtype: args.dtype ?? 'q8',
-  device: 'cpu',
-  progress_callback: (p) => {
-    if (p.status === 'progress' && p.total) {
-      const pct = Math.round((p.loaded / p.total) * 100)
-      process.stdout.write(`\rDownloading ${p.file ?? ''} ${pct}%`)
-    }
-  },
-})
-process.stdout.write('\n')
+const tts = await loadKokoro(args.dtype)
 
 const manifest = {
   version: 1,
@@ -87,7 +110,7 @@ for (let i = 0; i < segments.length; i++) {
   console.log(`[${label}] ${segment.text.slice(0, 80).replace(/\s+/g, ' ')}${segment.text.length > 80 ? '...' : ''}`)
   const started = performance.now()
   const audio = await tts.generate(segment.text, { voice, speed })
-  audio.save(audioPath)
+  await audio.save(audioPath)
   const duration = audio.audio.length / audio.sampling_rate
   const elapsed = (performance.now() - started) / 1000
   manifest.segments.push({
@@ -124,6 +147,8 @@ function parseArgs(argv) {
     else if (arg === '--dtype') out.dtype = argv[++i]
     else if (arg === '--limit') out.limit = argv[++i]
     else if (arg === '--dry-run') out.dryRun = true
+    else if (arg === '--preview-voice') out.previewVoice = true
+    else if (arg === '--preview-text') out.previewText = argv[++i]
     else if (!out.input) out.input = arg
     else throw new Error(`Unknown argument: ${arg}`)
   }
@@ -141,7 +166,24 @@ Options:
   --speed       Speech speed, default 1
   --dtype       q8, fp32, fp16, q4, q4f16; default q8
   --limit       Generate only first N segments for a quick sample
-  --dry-run     Extract/segment only; do not load Kokoro or generate audio`)
+  --dry-run     Extract/segment only; do not load Kokoro or generate audio
+  --preview-voice Generate one short WAV sample for the selected voice
+  --preview-text  Text to use with --preview-voice`)
+}
+
+async function loadKokoro(dtype) {
+  const tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+    dtype: dtype ?? 'q8',
+    device: 'cpu',
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.total) {
+        const pct = Math.round((p.loaded / p.total) * 100)
+        process.stdout.write(`\rDownloading ${p.file ?? ''} ${pct}%`)
+      }
+    },
+  })
+  process.stdout.write('\n')
+  return tts
 }
 
 async function extractSections(filePath) {
@@ -280,7 +322,11 @@ function ensureCommand(name) {
 }
 
 function safeBaseName(filePath) {
-  return stripExt(basename(filePath)).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'book'
+  return safeName(stripExt(basename(filePath))) || 'book'
+}
+
+function safeName(value) {
+  return value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
 }
 
 function stripExt(name) {

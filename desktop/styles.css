@@ -71,6 +71,12 @@ p {
   gap: 10px;
 }
 
+.voiceRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(130px, 1fr));

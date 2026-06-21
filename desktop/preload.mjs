@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('audioReadDesktop', {
   selectOutput: () => ipcRenderer.invoke('select-output'),
   openPath: path => ipcRenderer.invoke('open-path', path),
   startGeneration: options => ipcRenderer.invoke('start-generation', options),
+  previewVoice: options => ipcRenderer.invoke('preview-voice', options),
   cancelGeneration: () => ipcRenderer.invoke('cancel-generation'),
   onStarted: callback => {
     const handler = (_event, payload) => callback(payload)

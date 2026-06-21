@@ -7,6 +7,8 @@ const els = {
   chooseOutput: document.getElementById('chooseOutput'),
   openOutput: document.getElementById('openOutput'),
   voice: document.getElementById('voice'),
+  previewVoice: document.getElementById('previewVoice'),
+  previewText: document.getElementById('previewText'),
   speed: document.getElementById('speed'),
   dtype: document.getElementById('dtype'),
   limit: document.getElementById('limit'),
@@ -64,6 +66,27 @@ els.start.addEventListener('click', async () => {
   }
 })
 
+els.previewVoice.addEventListener('click', async () => {
+  if (running) return
+  const options = {
+    output: els.output.value,
+    voice: els.voice.value,
+    speed: els.speed.value,
+    dtype: els.dtype.value,
+    previewText: els.previewText.value,
+  }
+  setRunning(true)
+  setState('Previewing', `Generating ${els.voice.value} sample...`)
+  els.log.textContent = ''
+  try {
+    await api.previewVoice(options)
+  } catch (error) {
+    appendLog(`${error?.message ?? error}\n`)
+    setState('Error', String(error?.message ?? error))
+    setRunning(false)
+  }
+})
+
 els.cancel.addEventListener('click', async () => {
   await api.cancelGeneration()
   setState('Cancelled', 'Generation stopped.')
@@ -96,6 +119,7 @@ function setRunning(next) {
   els.cancel.disabled = !next
   els.chooseInput.disabled = next
   els.chooseOutput.disabled = next
+  els.previewVoice.disabled = next
 }
 
 function setState(state, detail) {

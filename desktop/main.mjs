@@ -100,6 +100,40 @@ ipcMain.handle('start-generation', async (event, options) => {
   return { output }
 })
 
+ipcMain.handle('preview-voice', async (event, options) => {
+  if (currentProcess) throw new Error('Generation is already running')
+  const output = options?.output || join(rootDir, 'audiobook-output', 'voice-previews')
+  mkdirSync(output, { recursive: true })
+
+  const voice = options?.voice || 'af_heart'
+  const args = [generatorPath, '--preview-voice', '--out', output, '--voice', voice]
+  if (options.speed) args.push('--speed', String(options.speed))
+  if (options.dtype) args.push('--dtype', options.dtype)
+  if (options.previewText) args.push('--preview-text', options.previewText)
+
+  currentProcess = spawn(process.execPath, args, {
+    cwd: rootDir,
+    env: process.env,
+  })
+
+  const previewPath = join(output, `voice-preview-${safeName(voice)}.wav`)
+  const send = (channel, payload) => event.sender.send(channel, payload)
+  send('generation-started', { output, command: `${process.execPath} ${args.map(quoteArg).join(' ')}` })
+
+  currentProcess.stdout.on('data', data => send('generation-log', data.toString()))
+  currentProcess.stderr.on('data', data => send('generation-log', data.toString()))
+  currentProcess.on('error', error => {
+    send('generation-done', { ok: false, code: null, output, error: error.message })
+    currentProcess = null
+  })
+  currentProcess.on('close', async code => {
+    if (code === 0 && existsSync(previewPath)) await shell.openPath(previewPath)
+    send('generation-done', { ok: code === 0, code, output, previewPath })
+    currentProcess = null
+  })
+  return { output, previewPath }
+})
+
 ipcMain.handle('cancel-generation', async () => {
   if (!currentProcess) return false
   currentProcess.kill('SIGTERM')
@@ -108,7 +142,11 @@ ipcMain.handle('cancel-generation', async () => {
 })
 
 function safeBaseName(filePath) {
-  return basename(filePath).replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'book'
+  return safeName(basename(filePath).replace(/\.[^.]+$/, '')) || 'book'
+}
+
+function safeName(value) {
+  return value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
 }
 
 function quoteArg(value) {

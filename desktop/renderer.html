@@ -36,18 +36,21 @@
         <div class="grid">
           <label class="field">
             Voice
-            <select id="voice">
-              <option value="af_heart">af_heart</option>
-              <option value="af_bella">af_bella</option>
-              <option value="af_nicole">af_nicole</option>
-              <option value="af_sarah">af_sarah</option>
-              <option value="af_sky">af_sky</option>
-              <option value="am_adam">am_adam</option>
-              <option value="am_michael">am_michael</option>
-              <option value="bf_emma">bf_emma</option>
-              <option value="bf_isabella">bf_isabella</option>
-              <option value="bm_george">bm_george</option>
-            </select>
+            <div class="voiceRow">
+              <select id="voice">
+                <option value="af_heart">af_heart</option>
+                <option value="af_bella">af_bella</option>
+                <option value="af_nicole">af_nicole</option>
+                <option value="af_sarah">af_sarah</option>
+                <option value="af_sky">af_sky</option>
+                <option value="am_adam">am_adam</option>
+                <option value="am_michael">am_michael</option>
+                <option value="bf_emma">bf_emma</option>
+                <option value="bf_isabella">bf_isabella</option>
+                <option value="bm_george">bm_george</option>
+              </select>
+              <button id="previewVoice" type="button">Preview</button>
+            </div>
           </label>
 
           <label class="field">
@@ -70,6 +73,11 @@
             <input id="limit" type="number" min="1" step="1" placeholder="Blank = full book" />
           </label>
         </div>
+
+        <label class="field wide">
+          Preview Text
+          <input id="previewText" value="This is a short voice preview from Audio Read." />
+        </label>
 
         <label class="check">
           <input id="dryRun" type="checkbox" />
