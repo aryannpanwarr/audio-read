@@ -23,9 +23,10 @@ function createWindow() {
     backgroundColor: '#101312',
     title: 'Audio Read Audiobook Generator',
     webPreferences: {
-      preload: join(__dirname, 'preload.mjs'),
+      preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
     },
   })
   win.loadFile(join(__dirname, 'renderer.html'))

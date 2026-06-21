@@ -25,6 +25,17 @@ const els = {
 let running = false
 let lastOutput = ''
 
+if (!api) {
+  setState('Bridge Error', 'Desktop bridge failed to load. Restart the app from the terminal.')
+  appendLog('window.audioReadDesktop is missing. Electron preload did not load.\n')
+  Object.values(els).forEach(element => {
+    if (element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLSelectElement) {
+      element.disabled = true
+    }
+  })
+  throw new Error('Desktop preload bridge missing')
+}
+
 els.chooseInput.addEventListener('click', async () => {
   const path = await api.selectInput()
   if (path) els.input.value = path
