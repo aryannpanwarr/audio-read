@@ -2,18 +2,19 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
   FlatList,
+  Modal,
   NativeEventEmitter,
   NativeModules,
   PermissionsAndroid,
   Platform,
   Pressable,
-  SafeAreaView,
   StatusBar,
   StyleSheet,
   Text,
   View,
   useColorScheme,
 } from 'react-native';
+import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
 import EpubView from './src/EpubView';
 import PdfView from './src/PdfView';
 import VoicePicker, {TtsVoice} from './src/VoicePicker';
@@ -237,6 +238,7 @@ function App() {
   const dark = useColorScheme() === 'dark';
   const colors = dark ? darkColors : lightColors;
   const styles = useMemo(() => makeStyles(colors), [colors]);
+  const insets = useSafeAreaInsets();
 
   const [library, setLibrary] = useState<LibraryBook[]>([]);
   const [view, setView] = useState<'library' | 'reader'>('library');
@@ -255,6 +257,7 @@ function App() {
   const [status, setStatus] = useState('Library ready');
   const [activeWordCount, setActiveWordCount] = useState(0);
   const [showVoices, setShowVoices] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
   const [epubHtml, setEpubHtml] = useState('');
   const [epubBaseUrl, setEpubBaseUrl] = useState('');
   const [pageCount, setPageCount] = useState(0);
@@ -777,13 +780,16 @@ function App() {
 
   if (view === 'library') {
     return (
-      <SafeAreaView style={styles.screen}>
+      <SafeAreaView style={styles.screen} edges={['top']}>
         <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
         <View style={styles.libraryHeader}>
           <View>
             <Text style={styles.title}>Audio Read</Text>
             <Text style={styles.subtitle}>Library</Text>
           </View>
+          <Pressable style={styles.kebabButton} onPress={() => setShowMenu(true)} hitSlop={10}>
+            <Text style={styles.kebabText}>⋮</Text>
+          </Pressable>
         </View>
 
         <FlatList
@@ -802,30 +808,52 @@ function App() {
           }
         />
 
-        <View style={styles.libraryFooter}>
+        <View style={[styles.libraryFooter, {paddingBottom: 14 + insets.bottom}]}>
           <Text style={styles.status} numberOfLines={2}>
             {status}
           </Text>
-          <View style={styles.homeButtonsRow}>
-            <Pressable
-              style={[styles.homeButton, styles.homeButtonPrimary, busy && styles.disabled]}
-              onPress={openDocument}
-              disabled={busy}>
-              <Text style={styles.homeButtonPrimaryText}>Import</Text>
-            </Pressable>
-            <Pressable
-              style={[styles.homeButton, voices.length === 0 && styles.disabled]}
-              onPress={() => setShowVoices(true)}
-              disabled={voices.length === 0}>
-              <Text style={styles.homeButtonText} numberOfLines={1}>
-                Voice
-              </Text>
-            </Pressable>
-            <Pressable style={styles.homeButton} onPress={exportLogs}>
-              <Text style={styles.homeButtonText}>Logs</Text>
-            </Pressable>
-          </View>
         </View>
+
+        <Modal
+          visible={showMenu}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setShowMenu(false)}>
+          <Pressable style={styles.menuBackdrop} onPress={() => setShowMenu(false)}>
+            <Pressable style={[styles.menuPanel, {top: insets.top + 56}]} onPress={() => {}}>
+              <Pressable
+                style={styles.menuItem}
+                onPress={() => {
+                  setShowMenu(false);
+                  void openDocument();
+                }}
+                disabled={busy}>
+                <Text style={styles.menuItemText}>Import</Text>
+              </Pressable>
+              <View style={styles.menuDivider} />
+              <Pressable
+                style={styles.menuItem}
+                onPress={() => {
+                  setShowMenu(false);
+                  setShowVoices(true);
+                }}
+                disabled={voices.length === 0}>
+                <Text style={[styles.menuItemText, voices.length === 0 && styles.disabled]}>
+                  Voice
+                </Text>
+              </Pressable>
+              <View style={styles.menuDivider} />
+              <Pressable
+                style={styles.menuItem}
+                onPress={() => {
+                  setShowMenu(false);
+                  void exportLogs();
+                }}>
+                <Text style={styles.menuItemText}>Logs</Text>
+              </Pressable>
+            </Pressable>
+          </Pressable>
+        </Modal>
 
         <VoicePicker
           visible={showVoices}
@@ -844,7 +872,7 @@ function App() {
   }
 
   return (
-    <SafeAreaView style={styles.screen}>
+    <SafeAreaView style={styles.screen} edges={['top']}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
       <View style={styles.header}>
         <Pressable style={styles.backButton} onPress={() => setView('library')} disabled={busy && !playing}>
@@ -858,6 +886,9 @@ function App() {
             {documentKind.toUpperCase()} · {formatTotalLength(totalSeconds)}
           </Text>
         </View>
+        <Pressable style={styles.kebabButton} onPress={() => setShowMenu(true)} hitSlop={10}>
+          <Text style={styles.kebabText}>⋮</Text>
+        </Pressable>
       </View>
 
       <View style={styles.progressTrack}>
@@ -905,7 +936,7 @@ function App() {
         )}
       </View>
 
-      <View style={styles.bottomBar}>
+      <View style={[styles.bottomBar, {paddingBottom: 14 + insets.bottom}]}>
         <View style={styles.timeRow}>
           <Text style={styles.timeText}>{formatClock(elapsedSeconds)}</Text>
           <Text style={[styles.status, styles.statusFlex]} numberOfLines={1}>
@@ -934,54 +965,68 @@ function App() {
             <Text style={styles.iconButtonText}>›</Text>
           </Pressable>
         </View>
-
-        <View style={styles.optionsRow}>
-          <View style={styles.optionBox}>
-            <Text style={styles.optionLabel}>Text</Text>
-            <View style={styles.stepperRow}>
-              <Pressable
-                onPress={() => setFontScale(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
-                <Text style={styles.stepperText}>A-</Text>
-              </Pressable>
-              <Text style={styles.optionValue}>{Math.round(fontScale * 100)}%</Text>
-              <Pressable
-                onPress={() => setFontScale(s => Math.min(1.8, Number((s + 0.1).toFixed(1))))}>
-                <Text style={styles.stepperText}>A+</Text>
-              </Pressable>
-            </View>
-          </View>
-          <View style={styles.optionBox}>
-            <Text style={styles.optionLabel}>Speed</Text>
-            <View style={styles.stepperRow}>
-              <Pressable
-                onPress={() => setSpeed(Math.max(0.7, Number((speed - 0.1).toFixed(1))))}
-                disabled={playing}>
-                <Text style={styles.stepperText}>-</Text>
-              </Pressable>
-              <Text style={styles.optionValue}>{speed.toFixed(1)}x</Text>
-              <Pressable
-                onPress={() => setSpeed(Math.min(1.8, Number((speed + 0.1).toFixed(1))))}
-                disabled={playing}>
-                <Text style={styles.stepperText}>+</Text>
-              </Pressable>
-            </View>
-          </View>
-          <View style={styles.optionBox}>
-            <Text style={styles.optionLabel}>Spacing</Text>
-            <View style={styles.stepperRow}>
-              <Pressable
-                onPress={() => setLineSpacing(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
-                <Text style={styles.stepperText}>-</Text>
-              </Pressable>
-              <Text style={styles.optionValue}>{Math.round(lineSpacing * 100)}%</Text>
-              <Pressable
-                onPress={() => setLineSpacing(s => Math.min(2.2, Number((s + 0.1).toFixed(1))))}>
-                <Text style={styles.stepperText}>+</Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
       </View>
+
+      <Modal
+        visible={showMenu}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowMenu(false)}>
+        <Pressable style={styles.menuBackdrop} onPress={() => setShowMenu(false)}>
+          <Pressable style={[styles.menuPanel, styles.menuPanelWide, {top: insets.top + 56}]} onPress={() => {}}>
+            <View style={styles.optionBox}>
+              <Text style={styles.optionLabel}>Text size</Text>
+              <View style={styles.stepperRow}>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setFontScale(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
+                  <Text style={styles.stepperText}>A-</Text>
+                </Pressable>
+                <Text style={styles.optionValue}>{Math.round(fontScale * 100)}%</Text>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setFontScale(s => Math.min(1.8, Number((s + 0.1).toFixed(1))))}>
+                  <Text style={styles.stepperText}>A+</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.optionBox}>
+              <Text style={styles.optionLabel}>Speed</Text>
+              <View style={styles.stepperRow}>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setSpeed(Math.max(0.7, Number((speed - 0.1).toFixed(1))))}
+                  disabled={playing}>
+                  <Text style={[styles.stepperText, playing && styles.disabled]}>-</Text>
+                </Pressable>
+                <Text style={styles.optionValue}>{speed.toFixed(1)}x</Text>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setSpeed(Math.min(1.8, Number((speed + 0.1).toFixed(1))))}
+                  disabled={playing}>
+                  <Text style={[styles.stepperText, playing && styles.disabled]}>+</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.optionBox}>
+              <Text style={styles.optionLabel}>Line spacing</Text>
+              <View style={styles.stepperRow}>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setLineSpacing(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
+                  <Text style={styles.stepperText}>-</Text>
+                </Pressable>
+                <Text style={styles.optionValue}>{Math.round(lineSpacing * 100)}%</Text>
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => setLineSpacing(s => Math.min(2.2, Number((s + 0.1).toFixed(1))))}>
+                  <Text style={styles.stepperText}>+</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1275,33 +1320,58 @@ function makeStyles(colors: typeof lightColors) {
     statusFlex: {
       flex: 1,
     },
-    homeButtonsRow: {
-      flexDirection: 'row',
-      gap: 10,
-    },
-    homeButton: {
-      flex: 1,
-      minHeight: 46,
-      borderRadius: 8,
-      backgroundColor: colors.bg,
-      borderColor: colors.border,
-      borderWidth: 1,
+    kebabButton: {
+      width: 42,
+      height: 42,
+      borderRadius: 21,
+      backgroundColor: colors.surface2,
       alignItems: 'center',
       justifyContent: 'center',
     },
-    homeButtonPrimary: {
-      backgroundColor: colors.accent,
-      borderColor: colors.accent,
+    kebabText: {
+      color: colors.text,
+      fontSize: 26,
+      lineHeight: 28,
+      fontWeight: '900',
     },
-    homeButtonText: {
-      color: colors.accent,
-      fontSize: 14,
-      fontWeight: '800',
+    menuBackdrop: {
+      flex: 1,
+      backgroundColor: 'rgba(0,0,0,0.35)',
     },
-    homeButtonPrimaryText: {
-      color: colors.accentText,
-      fontSize: 15,
-      fontWeight: '800',
+    menuPanel: {
+      position: 'absolute',
+      right: 12,
+      minWidth: 170,
+      borderRadius: 12,
+      backgroundColor: colors.surface,
+      borderColor: colors.border,
+      borderWidth: 1,
+      paddingVertical: 6,
+      shadowColor: '#000',
+      shadowOpacity: 0.3,
+      shadowRadius: 12,
+      shadowOffset: {width: 0, height: 6},
+      elevation: 8,
+    },
+    menuPanelWide: {
+      minWidth: 240,
+      paddingVertical: 8,
+      paddingHorizontal: 8,
+      gap: 8,
+    },
+    menuItem: {
+      paddingHorizontal: 16,
+      paddingVertical: 13,
+    },
+    menuItemText: {
+      color: colors.text,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    menuDivider: {
+      height: StyleSheet.hairlineWidth,
+      backgroundColor: colors.border,
+      marginHorizontal: 12,
     },
     controls: {
       flexDirection: 'row',
