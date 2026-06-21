@@ -208,11 +208,29 @@ function isWord(part: string) {
   return /\S/.test(part);
 }
 
-function formatDuration(seconds: number) {
+// Music-player style clock: H:MM:SS once past an hour, otherwise M:SS.
+function formatClock(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.round(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+// Rough words-per-minute the system voice averages at 1x; used only to estimate
+// total/elapsed book length for the player, never for actual timing.
+const BASE_WPM = 160;
+
+function formatTotalLength(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m} min`;
+  return 'under 1 min';
 }
 
 function App() {
@@ -228,12 +246,13 @@ function App() {
   const [sentences, setSentences] = useState<Sentence[]>([]);
   const [current, setCurrent] = useState(0);
   const [speed, setSpeed] = useState(1);
+  const [fontScale, setFontScale] = useState(1);
+  const [lineSpacing, setLineSpacing] = useState(1);
   const [ready, setReady] = useState<InitResult | null>(null);
   const [voiceIndex, setVoiceIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('Library ready');
-  const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
   const [showVoices, setShowVoices] = useState(false);
   const [epubHtml, setEpubHtml] = useState('');
@@ -369,6 +388,23 @@ function App() {
       ? Math.min(pageCount - 1, Math.floor((current / sentences.length) * pageCount))
       : 0;
 
+  // Per-sentence word counts, used to estimate how long the whole book runs and how
+  // much has been read so far (music-player style elapsed / total).
+  const wordCounts = useMemo(
+    () => sentences.map(item => splitWords(item.text).filter(isWord).length),
+    [sentences],
+  );
+  const totalWords = useMemo(() => wordCounts.reduce((sum, n) => sum + n, 0), [wordCounts]);
+  const wordsBefore = useMemo(() => {
+    let sum = 0;
+    for (let i = 0; i < current && i < wordCounts.length; i++) sum += wordCounts[i];
+    return sum;
+  }, [wordCounts, current]);
+  const wordsPerMinute = BASE_WPM * speed;
+  const wordsRead = wordsBefore + Math.min(activeWordCount, wordCounts[current] ?? 0);
+  const elapsedSeconds = totalWords ? (wordsRead / wordsPerMinute) * 60 : 0;
+  const totalSeconds = totalWords ? (totalWords / wordsPerMinute) * 60 : 0;
+
   // Called by the EPUB WebView once it has wrapped the whole book's text into sentence
   // spans. This is the single source of truth for TTS + highlighting.
   const handleEpubSentences = (list: string[]) => {
@@ -404,7 +440,6 @@ function App() {
     setActiveBookId(book.id);
     setDocumentTitle(book.title);
     setDocumentKind(book.kind);
-    setLastResult(null);
     setEpubHtml('');
     setEpubBaseUrl('');
     setPageCount(0);
@@ -559,9 +594,8 @@ function App() {
         }
         setStatus(`Reading ${index + 1} of ${segment.length}`);
         recordLog(`ui reading sentence=${index} chars=${speakText.length}`);
-        const result = await SystemTts.speak(speakText, selectedVoice, speed);
+        await SystemTts.speak(speakText, selectedVoice, speed);
         if (token !== playGeneration) return;
-        setLastResult(result);
         index += 1;
       }
       setStatus('Finished');
@@ -675,7 +709,14 @@ function App() {
 
   const renderSentenceItem = ({item}: {item: Sentence}) => (
     <Pressable onPress={() => skipTo(item.id)}>
-      <Text style={[styles.sentence, item.id === current && styles.currentSentence]}>{renderSentence(item)}</Text>
+      <Text
+        style={[
+          styles.sentence,
+          {fontSize: 19 * fontScale, lineHeight: 32 * lineSpacing},
+          item.id === current && styles.currentSentence,
+        ]}>
+        {renderSentence(item)}
+      </Text>
     </Pressable>
   );
 
@@ -743,9 +784,6 @@ function App() {
             <Text style={styles.title}>Audio Read</Text>
             <Text style={styles.subtitle}>Library</Text>
           </View>
-          <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
-            <Text style={styles.openButtonText}>Import</Text>
-          </Pressable>
         </View>
 
         <FlatList
@@ -768,10 +806,39 @@ function App() {
           <Text style={styles.status} numberOfLines={2}>
             {status}
           </Text>
-          <Pressable style={styles.logButtonWide} onPress={exportLogs}>
-            <Text style={styles.logButtonText}>Export Logs</Text>
-          </Pressable>
+          <View style={styles.homeButtonsRow}>
+            <Pressable
+              style={[styles.homeButton, styles.homeButtonPrimary, busy && styles.disabled]}
+              onPress={openDocument}
+              disabled={busy}>
+              <Text style={styles.homeButtonPrimaryText}>Import</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.homeButton, voices.length === 0 && styles.disabled]}
+              onPress={() => setShowVoices(true)}
+              disabled={voices.length === 0}>
+              <Text style={styles.homeButtonText} numberOfLines={1}>
+                Voice
+              </Text>
+            </Pressable>
+            <Pressable style={styles.homeButton} onPress={exportLogs}>
+              <Text style={styles.homeButtonText}>Logs</Text>
+            </Pressable>
+          </View>
         </View>
+
+        <VoicePicker
+          visible={showVoices}
+          voices={voices}
+          selectedIndex={voiceIndex}
+          colors={colors}
+          onSelect={setVoiceIndex}
+          onPreview={previewVoice}
+          onClose={() => {
+            void SystemTts.stop();
+            setShowVoices(false);
+          }}
+        />
       </SafeAreaView>
     );
   }
@@ -788,12 +855,9 @@ function App() {
             {documentTitle || 'Reader'}
           </Text>
           <Text style={styles.subtitle} numberOfLines={1}>
-            {documentKind.toUpperCase()} · {sentences.length} sections
+            {documentKind.toUpperCase()} · {formatTotalLength(totalSeconds)}
           </Text>
         </View>
-        <Pressable style={[styles.openButton, busy && styles.disabled]} onPress={openDocument} disabled={busy}>
-          <Text style={styles.openButtonText}>Import</Text>
-        </Pressable>
       </View>
 
       <View style={styles.progressTrack}>
@@ -808,6 +872,8 @@ function App() {
             currentIndex={current}
             dark={dark}
             bg={colors.bg}
+            fontScale={fontScale}
+            lineSpacing={lineSpacing}
             onSentences={handleEpubSentences}
             onSelectSentence={skipTo}
             onError={handleEpubError}
@@ -840,9 +906,13 @@ function App() {
       </View>
 
       <View style={styles.bottomBar}>
-        <Text style={styles.status} numberOfLines={2}>
-          {status}
-        </Text>
+        <View style={styles.timeRow}>
+          <Text style={styles.timeText}>{formatClock(elapsedSeconds)}</Text>
+          <Text style={[styles.status, styles.statusFlex]} numberOfLines={1}>
+            {status}
+          </Text>
+          <Text style={[styles.timeText, styles.timeTextRight]}>{formatClock(totalSeconds)}</Text>
+        </View>
 
         <View style={styles.controls}>
           <Pressable
@@ -866,17 +936,20 @@ function App() {
         </View>
 
         <View style={styles.optionsRow}>
-          <Pressable
-            style={styles.optionBox}
-            onPress={() => setShowVoices(true)}
-            disabled={playing || voices.length === 0}>
-            <Text style={styles.optionLabel}>Voice</Text>
+          <View style={styles.optionBox}>
+            <Text style={styles.optionLabel}>Text</Text>
             <View style={styles.stepperRow}>
-              <Text style={styles.optionValue} numberOfLines={1}>
-                {voices[voiceIndex]?.label ?? voices[voiceIndex]?.locale ?? 'System'}
-              </Text>
+              <Pressable
+                onPress={() => setFontScale(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
+                <Text style={styles.stepperText}>A-</Text>
+              </Pressable>
+              <Text style={styles.optionValue}>{Math.round(fontScale * 100)}%</Text>
+              <Pressable
+                onPress={() => setFontScale(s => Math.min(1.8, Number((s + 0.1).toFixed(1))))}>
+                <Text style={styles.stepperText}>A+</Text>
+              </Pressable>
             </View>
-          </Pressable>
+          </View>
           <View style={styles.optionBox}>
             <Text style={styles.optionLabel}>Speed</Text>
             <View style={styles.stepperRow}>
@@ -893,29 +966,22 @@ function App() {
               </Pressable>
             </View>
           </View>
-          <Pressable style={styles.logButton} onPress={exportLogs}>
-            <Text style={styles.logButtonText}>Logs</Text>
-          </Pressable>
+          <View style={styles.optionBox}>
+            <Text style={styles.optionLabel}>Spacing</Text>
+            <View style={styles.stepperRow}>
+              <Pressable
+                onPress={() => setLineSpacing(s => Math.max(0.8, Number((s - 0.1).toFixed(1))))}>
+                <Text style={styles.stepperText}>-</Text>
+              </Pressable>
+              <Text style={styles.optionValue}>{Math.round(lineSpacing * 100)}%</Text>
+              <Pressable
+                onPress={() => setLineSpacing(s => Math.min(2.2, Number((s + 0.1).toFixed(1))))}>
+                <Text style={styles.stepperText}>+</Text>
+              </Pressable>
+            </View>
+          </View>
         </View>
-
-        <Text style={styles.meta}>
-          {sentences.length ? `${current + 1}/${sentences.length}` : '0/0'}
-          {lastResult ? ` · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
-        </Text>
       </View>
-
-      <VoicePicker
-        visible={showVoices}
-        voices={voices}
-        selectedIndex={voiceIndex}
-        colors={colors}
-        onSelect={setVoiceIndex}
-        onPreview={previewVoice}
-        onClose={() => {
-          void SystemTts.stop();
-          setShowVoices(false);
-        }}
-      />
     </SafeAreaView>
   );
 }
@@ -1187,9 +1253,55 @@ function makeStyles(colors: typeof lightColors) {
       gap: 10,
     },
     status: {
-      color: colors.text,
-      fontSize: 14,
+      color: colors.muted,
+      fontSize: 12,
       textAlign: 'center',
+    },
+    timeRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    timeText: {
+      color: colors.text,
+      fontSize: 12,
+      fontWeight: '700',
+      fontVariant: ['tabular-nums'],
+      minWidth: 52,
+    },
+    timeTextRight: {
+      textAlign: 'right',
+    },
+    statusFlex: {
+      flex: 1,
+    },
+    homeButtonsRow: {
+      flexDirection: 'row',
+      gap: 10,
+    },
+    homeButton: {
+      flex: 1,
+      minHeight: 46,
+      borderRadius: 8,
+      backgroundColor: colors.bg,
+      borderColor: colors.border,
+      borderWidth: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    homeButtonPrimary: {
+      backgroundColor: colors.accent,
+      borderColor: colors.accent,
+    },
+    homeButtonText: {
+      color: colors.accent,
+      fontSize: 14,
+      fontWeight: '800',
+    },
+    homeButtonPrimaryText: {
+      color: colors.accentText,
+      fontSize: 15,
+      fontWeight: '800',
     },
     controls: {
       flexDirection: 'row',

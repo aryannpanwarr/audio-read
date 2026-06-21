@@ -14,6 +14,8 @@ type EpubViewProps = {
   currentIndex: number;
   dark: boolean;
   bg: string;
+  fontScale: number;
+  lineSpacing: number;
   onSentences: (sentences: string[]) => void;
   onSelectSentence: (index: number) => void;
   onError?: (message: string) => void;
@@ -122,6 +124,17 @@ const buildInjectedScript = (dark: boolean) => `
       }
     }, true);
 
+    // Live text-size / line-spacing control. A dedicated <style> appended after the
+    // base reader stylesheet wins, so RN can rescale typography without a reload.
+    window.arSetType = function(fs, ls){
+      var s = document.getElementById('ar-type-style');
+      if (!s) { s = document.createElement('style'); s.id = 'ar-type-style'; document.head.appendChild(s); }
+      var size = (1.18 * fs).toFixed(3);
+      var lh = (1.75 * ls).toFixed(3);
+      s.textContent = 'body{font-size:' + size + 'rem !important;line-height:' + lh + ' !important;}'
+        + 'p,li,div,section,article,blockquote{line-height:' + lh + ' !important;}';
+    };
+
     window.arHighlight = function(i){
       var prev = document.querySelector('.ar-active');
       if (prev) { document.querySelectorAll('.ar-active').forEach(function(e){e.classList.remove('ar-active');}); }
@@ -148,6 +161,8 @@ function EpubView({
   currentIndex,
   dark,
   bg,
+  fontScale,
+  lineSpacing,
   onSentences,
   onSelectSentence,
   onError,
@@ -163,6 +178,14 @@ function EpubView({
       `window.arHighlight && window.arHighlight(${currentIndex}); true;`,
     );
   }, [currentIndex]);
+
+  // Live-apply text size / line spacing changes once the book is ready.
+  useEffect(() => {
+    if (!readyRef.current) return;
+    webRef.current?.injectJavaScript(
+      `window.arSetType && window.arSetType(${fontScale}, ${lineSpacing}); true;`,
+    );
+  }, [fontScale, lineSpacing]);
 
   // Reset state when the book content changes.
   useEffect(() => {
@@ -192,9 +215,10 @@ function EpubView({
         if (data.type === 'sentences' && data.list) {
           readyRef.current = true;
           onSentences(data.list);
-          // Apply the current highlight once content is ready.
+          // Apply current typography + highlight once content is ready.
           webRef.current?.injectJavaScript(
-            `window.arHighlight && window.arHighlight(${currentIndex}); true;`,
+            `window.arSetType && window.arSetType(${fontScale}, ${lineSpacing});` +
+              `window.arHighlight && window.arHighlight(${currentIndex}); true;`,
           );
         } else if (data.type === 'tap' && typeof data.index === 'number') {
           onSelectSentence(data.index);
@@ -205,7 +229,7 @@ function EpubView({
         // Ignore malformed messages.
       }
     },
-    [currentIndex, onSentences, onSelectSentence, onError],
+    [currentIndex, fontScale, lineSpacing, onSentences, onSelectSentence, onError],
   );
 
   return (
