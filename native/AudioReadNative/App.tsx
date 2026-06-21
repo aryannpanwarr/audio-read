@@ -14,12 +14,22 @@ import {
   View,
   useColorScheme,
 } from 'react-native';
+import EpubView from './src/EpubView';
+import PdfView from './src/PdfView';
+import VoicePicker, {TtsVoice} from './src/VoicePicker';
 
-type TtsVoice = {
-  name: string;
-  locale: string;
-  quality: number;
-  label?: string;
+type EpubChapter = {
+  uri: string;
+  path: string;
+};
+
+type BookManifest = {
+  id: string;
+  kind: 'pdf' | 'epub' | 'text';
+  chapters?: EpubChapter[];
+  baseDir?: string;
+  pageCount?: number;
+  sourcePath?: string;
 };
 
 type InitResult = {
@@ -57,6 +67,7 @@ type LibraryBook = {
   createdAt: number;
   updatedAt: number;
   lastPosition: number;
+  lastChapter?: number;
 };
 
 type LoadedLibraryBook = LibraryBook & {
@@ -92,6 +103,7 @@ type DocumentReaderModule = {
   loadLibraryDocument(id: string): Promise<LoadedLibraryBook>;
   updateLibraryDocument(id: string, patch: Partial<LibraryBook>): Promise<LibraryBook>;
   deleteLibraryDocument(id: string): Promise<void>;
+  getBookManifest(id: string): Promise<BookManifest>;
 };
 
 const SystemTts = NativeModules.SystemTts as SystemTtsModule;
@@ -217,6 +229,10 @@ function App() {
   const [status, setStatus] = useState('Library ready');
   const [lastResult, setLastResult] = useState<SpeakResult | null>(null);
   const [activeWordCount, setActiveWordCount] = useState(0);
+  const [showVoices, setShowVoices] = useState(false);
+  const [chapters, setChapters] = useState<EpubChapter[]>([]);
+  const [chapterIndex, setChapterIndex] = useState(0);
+  const [pageCount, setPageCount] = useState(0);
   const playTokenRef = useRef(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
@@ -225,6 +241,9 @@ function App() {
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
   const backgroundPermissionPromptedRef = useRef(false);
+  const chaptersRef = useRef(chapters);
+  const chapterIndexRef = useRef(chapterIndex);
+  const sentencesResolveRef = useRef<((value: Sentence[]) => void) | null>(null);
 
   const voices = ready?.voices ?? [];
   const selectedVoice = voices[voiceIndex]?.name ?? null;
@@ -325,7 +344,9 @@ function App() {
   useEffect(() => {
     sentencesRef.current = sentences;
     currentRef.current = current;
-  }, [sentences, current]);
+    chaptersRef.current = chapters;
+    chapterIndexRef.current = chapterIndex;
+  }, [sentences, current, chapters, chapterIndex]);
 
   useEffect(() => {
     if (sentences.length) {
@@ -337,7 +358,107 @@ function App() {
     }
   }, [current, sentences.length]);
 
-  const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
+  const withinChapter = sentences.length ? (current + 1) / sentences.length : 0;
+  const progress =
+    documentKind === 'epub' && chapters.length
+      ? Math.round(((chapterIndex + withinChapter) / chapters.length) * 100)
+      : sentences.length
+        ? Math.round(withinChapter * 100)
+        : 0;
+  const pdfCurrentPage =
+    pageCount > 0 && sentences.length > 0
+      ? Math.min(pageCount - 1, Math.floor((current / sentences.length) * pageCount))
+      : 0;
+
+  // Called by the EPUB WebView once it has wrapped a chapter's text into sentence
+  // spans. This becomes the source of truth for TTS + highlighting in that chapter.
+  const handleEpubSentences = (list: string[]) => {
+    const parsed = list.map((text, id) => ({id, text}));
+    setSentences(parsed);
+    sentencesRef.current = parsed;
+    const resolve = sentencesResolveRef.current;
+    if (resolve) {
+      sentencesResolveRef.current = null;
+      resolve(parsed);
+    }
+  };
+
+  const loadChapterAndWait = (index: number): Promise<Sentence[]> =>
+    new Promise(resolve => {
+      let settled = false;
+      const finish = (value: Sentence[]) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      sentencesResolveRef.current = finish;
+      setChapterIndex(index);
+      chapterIndexRef.current = index;
+      // Safety net in case the chapter has no readable text / fails to report.
+      setTimeout(() => finish(sentencesRef.current), 8000);
+    });
+
+  const loadManifest = async (book: LibraryBook) => {
+    setChapters([]);
+    setChapterIndex(0);
+    setPageCount(0);
+    chaptersRef.current = [];
+    chapterIndexRef.current = 0;
+    if (book.kind !== 'epub' && book.kind !== 'pdf') return;
+    try {
+      const manifest = await DocumentReader.getBookManifest(book.id);
+      if (manifest.kind === 'epub' && manifest.chapters?.length) {
+        const startChapter = Math.max(0, Math.min(manifest.chapters.length - 1, book.lastChapter ?? 0));
+        setChapters(manifest.chapters);
+        chaptersRef.current = manifest.chapters;
+        setChapterIndex(startChapter);
+        chapterIndexRef.current = startChapter;
+        recordLog(`ui epub manifest chapters=${manifest.chapters.length} start=${startChapter}`);
+      } else if (manifest.kind === 'pdf' && manifest.pageCount) {
+        setPageCount(manifest.pageCount);
+        recordLog(`ui pdf manifest pages=${manifest.pageCount}`);
+      }
+    } catch (error) {
+      recordLog(`ui manifest load failed ${describeError(error)}`);
+    }
+  };
+
+  const enterReader = async (book: LibraryBook, text: string) => {
+    playTokenRef.current++;
+    await SystemTts.stop();
+    await SystemTts.stopPlaybackSession();
+    clearWordProgress();
+    setPlaying(false);
+    setActiveBookId(book.id);
+    setDocumentTitle(book.title);
+    setDocumentKind(book.kind);
+    setLastResult(null);
+    setView('reader');
+    if (book.kind === 'epub') {
+      setSentences([]);
+      sentencesRef.current = [];
+      setCurrent(Math.max(0, book.lastPosition || 0));
+      setStatus('Loading book layout...');
+      await loadManifest(book);
+      // Older books (saved before original-layout rendering) have no extracted
+      // chapter assets; fall back to the plain-text reader so they still work.
+      if (!chaptersRef.current.length) {
+        const parsed = splitSentences(text);
+        setSentences(parsed);
+        sentencesRef.current = parsed;
+        setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
+        setStatus('Ready to read');
+        recordLog('ui epub fallback to text reader (no render assets)');
+      }
+    } else {
+      const parsed = splitSentences(text);
+      setSentences(parsed);
+      sentencesRef.current = parsed;
+      setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
+      setStatus('Ready to read');
+      if (book.kind === 'pdf') await loadManifest(book);
+    }
+  };
 
   const openDocument = async () => {
     try {
@@ -347,10 +468,6 @@ function App() {
       const doc = await DocumentReader.pickDocument();
       const parsed = splitSentences(doc.text);
       if (!parsed.length) throw new Error('No readable sentences found in this document');
-      playTokenRef.current++;
-      await SystemTts.stop();
-      await SystemTts.stopPlaybackSession();
-      clearWordProgress();
       const book = await DocumentReader.saveLibraryDocument(
         doc.title,
         doc.kind,
@@ -359,14 +476,7 @@ function App() {
         parsed.length,
       );
       updateBookInState(book);
-      setPlaying(false);
-      setActiveBookId(book.id);
-      setDocumentTitle(doc.title);
-      setDocumentKind(doc.kind);
-      setSentences(parsed);
-      setCurrent(0);
-      setLastResult(null);
-      setView('reader');
+      await enterReader(book, doc.text);
       setStatus(`${doc.kind.toUpperCase()} added · ready to read`);
       recordLog(`ui document loaded title=${doc.title} kind=${doc.kind} sentences=${parsed.length}`);
     } catch (error) {
@@ -389,21 +499,7 @@ function App() {
       setBusy(true);
       setStatus('Opening book...');
       const loaded = await DocumentReader.loadLibraryDocument(book.id);
-      const parsed = splitSentences(loaded.text);
-      if (!parsed.length) throw new Error('No readable sentences found in this book');
-      playTokenRef.current++;
-      await SystemTts.stop();
-      await SystemTts.stopPlaybackSession();
-      clearWordProgress();
-      setPlaying(false);
-      setActiveBookId(loaded.id);
-      setDocumentTitle(loaded.title);
-      setDocumentKind(loaded.kind);
-      setSentences(parsed);
-      setCurrent(Math.max(0, Math.min(parsed.length - 1, loaded.lastPosition || 0)));
-      setLastResult(null);
-      setView('reader');
-      setStatus('Ready to read');
+      await enterReader(loaded, loaded.text);
     } catch (error) {
       Alert.alert('Could not open book', describeError(error));
       setStatus('Book open failed');
@@ -424,6 +520,8 @@ function App() {
         clearWordProgress();
         setActiveBookId(null);
         setSentences([]);
+        setChapters([]);
+        setPageCount(0);
         setCurrent(0);
         setPlaying(false);
         setView('library');
@@ -434,8 +532,17 @@ function App() {
     }
   };
 
+  const persistProgress = (index: number) => {
+    if (!activeBookId) return;
+    const patch: Partial<LibraryBook> = {lastPosition: index};
+    if (documentKind === 'epub') patch.lastChapter = chapterIndexRef.current;
+    void DocumentReader.updateLibraryDocument(activeBookId, patch)
+      .then(updateBookInState)
+      .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
+  };
+
   const speakAt = async (startIndex: number) => {
-    if (!sentences.length) return;
+    if (!sentencesRef.current.length && documentKind !== 'epub') return;
     const token = ++playTokenRef.current;
     setPlaying(true);
     setBusy(true);
@@ -443,24 +550,53 @@ function App() {
       void requestBackgroundPermission();
       await ensureReady();
       await SystemTts.startPlaybackSession();
-      for (let index = startIndex; index < sentences.length; index++) {
+      // EPUB chapters report their sentences asynchronously from the WebView; wait for
+      // the current chapter before reading so we don't skip it.
+      if (documentKind === 'epub' && !sentencesRef.current.length) {
+        setStatus('Preparing chapter...');
+        await new Promise<Sentence[]>(resolve => {
+          let settled = false;
+          const finish = (value: Sentence[]) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          sentencesResolveRef.current = finish;
+          setTimeout(() => finish(sentencesRef.current), 8000);
+        });
         if (token !== playTokenRef.current) return;
-        const sentence = sentences[index];
-        setCurrent(index);
-        if (activeBookId) {
-          void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: index})
-            .then(updateBookInState)
-            .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
+      }
+      let index = startIndex;
+      while (true) {
+        if (token !== playTokenRef.current) return;
+        const segment = sentencesRef.current;
+        if (index >= segment.length) {
+          // EPUB: advance to the next chapter and keep reading.
+          if (documentKind === 'epub' && chapterIndexRef.current < chaptersRef.current.length - 1) {
+            setStatus('Loading next chapter...');
+            await loadChapterAndWait(chapterIndexRef.current + 1);
+            if (token !== playTokenRef.current) return;
+            index = 0;
+            setCurrent(0);
+            continue;
+          }
+          break;
         }
+        const sentence = segment[index];
+        setCurrent(index);
+        persistProgress(index);
         setActiveWordCount(0);
-        setStatus(`Reading ${index + 1} of ${sentences.length}`);
-        recordLog(`ui reading sentence=${index} chars=${sentence.text.length}`);
-        const result = await SystemTts.speak(sentence.text, selectedVoice, speed);
+        const speakText = sentence.text.trim();
+        if (speakText.length < 2) {
+          index += 1;
+          continue;
+        }
+        setStatus(`Reading ${index + 1} of ${segment.length}`);
+        recordLog(`ui reading sentence=${index} chars=${speakText.length}`);
+        const result = await SystemTts.speak(speakText, selectedVoice, speed);
         if (token !== playTokenRef.current) return;
         setLastResult(result);
-        recordLog(
-          `ui sentence done index=${index} audio=${result.audioDurationSeconds.toFixed(3)}s source=${result.source ?? 'system'}`,
-        );
+        index += 1;
       }
       setStatus('Finished');
       setPlaying(false);
@@ -506,11 +642,7 @@ function App() {
     await SystemTts.stop();
     clearWordProgress();
     setCurrent(bounded);
-    if (activeBookId) {
-      void DocumentReader.updateLibraryDocument(activeBookId, {lastPosition: bounded})
-        .then(updateBookInState)
-        .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
-    }
+    persistProgress(bounded);
     setPlaying(false);
     setBusy(false);
     if (shouldResume) {
@@ -533,6 +665,9 @@ function App() {
     };
     timingHandlerRef.current = startWordProgress;
   });
+
+  const handlePdfError = useCallback((message: string) => recordLog(`pdf view ${message}`), []);
+  const handleEpubError = useCallback((message: string) => recordLog(`epub view ${message}`), []);
 
   const exportLogs = async () => {
     try {
@@ -684,18 +819,43 @@ function App() {
         <View style={[styles.progressFill, {width: `${progress}%`}]} />
       </View>
 
-      <FlatList
-        ref={listRef}
-        data={sentences}
-        keyExtractor={item => String(item.id)}
-        renderItem={renderSentenceItem}
-        contentContainerStyle={styles.readerContent}
-        initialNumToRender={20}
-        maxToRenderPerBatch={14}
-        windowSize={9}
-        removeClippedSubviews
-        onScrollToIndexFailed={handleScrollToIndexFailed}
-      />
+      <View style={styles.readerBody}>
+        {documentKind === 'epub' && chapters.length ? (
+          <EpubView
+            chapterUri={chapters[chapterIndex].uri}
+            currentIndex={current}
+            dark={dark}
+            bg={colors.bg}
+            onSentences={handleEpubSentences}
+            onSelectSentence={skipTo}
+            onError={handleEpubError}
+          />
+        ) : documentKind === 'pdf' && pageCount > 0 && activeBookId ? (
+          <PdfView
+            bookId={activeBookId}
+            pageCount={pageCount}
+            currentPage={pdfCurrentPage}
+            colors={colors}
+            onSelectPage={page =>
+              skipTo(Math.floor((page / Math.max(1, pageCount)) * sentences.length))
+            }
+            onError={handlePdfError}
+          />
+        ) : (
+          <FlatList
+            ref={listRef}
+            data={sentences}
+            keyExtractor={item => String(item.id)}
+            renderItem={renderSentenceItem}
+            contentContainerStyle={styles.readerContent}
+            initialNumToRender={20}
+            maxToRenderPerBatch={14}
+            windowSize={9}
+            removeClippedSubviews
+            onScrollToIndexFailed={handleScrollToIndexFailed}
+          />
+        )}
+      </View>
 
       <View style={styles.bottomBar}>
         <Text style={styles.status} numberOfLines={2}>
@@ -724,22 +884,17 @@ function App() {
         </View>
 
         <View style={styles.optionsRow}>
-          <View style={styles.optionBox}>
+          <Pressable
+            style={styles.optionBox}
+            onPress={() => setShowVoices(true)}
+            disabled={playing || voices.length === 0}>
             <Text style={styles.optionLabel}>Voice</Text>
             <View style={styles.stepperRow}>
-              <Pressable onPress={() => setVoiceIndex(Math.max(0, voiceIndex - 1))} disabled={playing || voices.length < 2}>
-                <Text style={styles.stepperText}>-</Text>
-              </Pressable>
               <Text style={styles.optionValue} numberOfLines={1}>
                 {voices[voiceIndex]?.label ?? voices[voiceIndex]?.locale ?? 'System'}
               </Text>
-              <Pressable
-                onPress={() => setVoiceIndex(Math.min(Math.max(0, voices.length - 1), voiceIndex + 1))}
-                disabled={playing || voices.length < 2}>
-                <Text style={styles.stepperText}>+</Text>
-              </Pressable>
             </View>
-          </View>
+          </Pressable>
           <View style={styles.optionBox}>
             <Text style={styles.optionLabel}>Speed</Text>
             <View style={styles.stepperRow}>
@@ -762,10 +917,20 @@ function App() {
         </View>
 
         <Text style={styles.meta}>
+          {documentKind === 'epub' && chapters.length ? `Ch ${chapterIndex + 1}/${chapters.length} · ` : ''}
           {sentences.length ? `${current + 1}/${sentences.length}` : '0/0'}
           {lastResult ? ` · ${formatDuration(lastResult.audioDurationSeconds)}` : ''}
         </Text>
       </View>
+
+      <VoicePicker
+        visible={showVoices}
+        voices={voices}
+        selectedIndex={voiceIndex}
+        colors={colors}
+        onSelect={setVoiceIndex}
+        onClose={() => setShowVoices(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -984,6 +1149,9 @@ function makeStyles(colors: typeof lightColors) {
       borderTopColor: colors.border,
       borderTopWidth: 1,
       gap: 10,
+    },
+    readerBody: {
+      flex: 1,
     },
     readerContent: {
       padding: 22,

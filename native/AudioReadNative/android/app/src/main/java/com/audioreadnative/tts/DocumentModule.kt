@@ -2,7 +2,12 @@ package com.audioreadnative.tts
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import com.audioreadnative.LogStore
 import com.facebook.react.bridge.ActivityEventListener
@@ -18,11 +23,13 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.File
 import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
 import java.io.StringReader
 import java.util.UUID
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import kotlin.math.max
 import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
@@ -142,10 +149,17 @@ class DocumentModule(
           put("updatedAt", now)
           put("lastPosition", 0)
         }
+        // Persist the original document so we can render it later without relying on the
+        // (potentially revoked) content URI.
+        try {
+          prepareRenderAssets(id, kind, Uri.parse(uri), item)
+        } catch (e: Throwable) {
+          LogStore.write(DOCUMENT_TAG, "prepareRenderAssets failed id=$id: ${e.stackTraceToString()}")
+        }
         val items = readLibraryIndex().filter { it.optString("uri") != uri }.toMutableList()
         items.add(item)
         writeLibraryIndex(items)
-        LogStore.write(DOCUMENT_TAG, "library saved id=$id title=$title sentences=$sentenceCount")
+        LogStore.write(DOCUMENT_TAG, "library saved id=$id title=$title sentences=$sentenceCount kind=$kind")
         promise.resolve(item.toWritableMap())
       } catch (e: Throwable) {
         LogStore.write(DOCUMENT_TAG, "saveLibraryDocument failed: ${e.stackTraceToString()}")
@@ -206,6 +220,9 @@ class DocumentModule(
         val items = readLibraryIndex().filterNot { it.optString("id") == id }
         writeLibraryIndex(items)
         File(libraryRoot(), "$id.txt").delete()
+        sourceFile(id).delete()
+        epubDir(id).deleteRecursively()
+        clearRenderedPages(id)
         LogStore.write(DOCUMENT_TAG, "library deleted id=$id")
         promise.resolve(null)
       } catch (e: Throwable) {
@@ -213,6 +230,200 @@ class DocumentModule(
         promise.reject("LIBRARY_DELETE_FAILED", e.message, e)
       }
     }.start()
+  }
+
+  /**
+   * Returns rendering metadata for a saved book so the JS layer can show the original
+   * document. For EPUB: an ordered list of file:// spine chapter URIs + base dir. For
+   * PDF: the page count and source file path.
+   */
+  @ReactMethod
+  fun getBookManifest(id: String, promise: Promise) {
+    Thread {
+      try {
+        val item = readLibraryIndex().firstOrNull { it.optString("id") == id }
+          ?: throw IllegalArgumentException("Book not found in library")
+        val kind = item.optString("kind")
+        val map = Arguments.createMap()
+        map.putString("id", id)
+        map.putString("kind", kind)
+        when (kind) {
+          "epub" -> {
+            val dir = epubDir(id)
+            val spine = item.optJSONArray("spine")
+            if (!dir.exists() || spine == null || spine.length() == 0) {
+              throw IllegalStateException("EPUB render assets unavailable")
+            }
+            val chapters = Arguments.createArray()
+            for (i in 0 until spine.length()) {
+              val rel = spine.getString(i)
+              val file = File(dir, rel)
+              if (file.exists()) {
+                chapters.pushMap(Arguments.createMap().apply {
+                  putString("uri", Uri.fromFile(file).toString())
+                  putString("path", rel)
+                })
+              }
+            }
+            map.putArray("chapters", chapters)
+            map.putString("baseDir", Uri.fromFile(dir).toString())
+          }
+          "pdf" -> {
+            val src = sourceFile(id)
+            if (!src.exists()) throw IllegalStateException("PDF source unavailable")
+            map.putInt("pageCount", item.optInt("pageCount", pdfPageCount(src)))
+            map.putString("sourcePath", src.absolutePath)
+          }
+          else -> Unit
+        }
+        promise.resolve(map)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "getBookManifest failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("BOOK_MANIFEST_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  /** Renders a single PDF page to a cached PNG and returns its path + pixel size. */
+  @ReactMethod
+  fun renderPdfPage(id: String, pageIndex: Int, targetWidth: Int, promise: Promise) {
+    Thread {
+      try {
+        val src = sourceFile(id)
+        if (!src.exists()) throw IllegalStateException("PDF source unavailable")
+        val outFile = File(renderedPagesDir(id), "p${pageIndex}_w${targetWidth}.png")
+        if (!outFile.exists()) {
+          renderedPagesDir(id).mkdirs()
+          ParcelFileDescriptor.open(src, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+            PdfRenderer(pfd).use { renderer ->
+              if (pageIndex < 0 || pageIndex >= renderer.pageCount) {
+                throw IllegalArgumentException("Page out of range")
+              }
+              renderer.openPage(pageIndex).use { page ->
+                val width = if (targetWidth > 0) targetWidth else page.width
+                val scale = width.toFloat() / page.width.toFloat()
+                val height = max(1, (page.height * scale).toInt())
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(Color.WHITE)
+                Canvas(bitmap).drawColor(Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                FileOutputStream(outFile).use { out ->
+                  bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+                }
+                bitmap.recycle()
+              }
+            }
+          }
+        }
+        val (w, h) = pngDimensions(outFile)
+        promise.resolve(Arguments.createMap().apply {
+          putString("uri", Uri.fromFile(outFile).toString())
+          putInt("page", pageIndex)
+          putInt("width", w)
+          putInt("height", h)
+        })
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "renderPdfPage failed id=$id page=$pageIndex: ${e.stackTraceToString()}")
+        promise.reject("PDF_RENDER_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  private fun prepareRenderAssets(id: String, kind: String, uri: Uri, item: JSONObject) {
+    when (kind) {
+      "pdf" -> {
+        val src = sourceFile(id)
+        copyUriToFile(uri, src)
+        item.put("pageCount", pdfPageCount(src))
+        LogStore.write(DOCUMENT_TAG, "pdf source cached id=$id pages=${item.optInt("pageCount")}")
+      }
+      "epub" -> {
+        val src = sourceFile(id)
+        copyUriToFile(uri, src)
+        val spine = unzipEpubToDir(src, epubDir(id))
+        val array = JSONArray()
+        spine.forEach { array.put(it) }
+        item.put("spine", array)
+        LogStore.write(DOCUMENT_TAG, "epub assets extracted id=$id chapters=${spine.size}")
+      }
+      else -> Unit
+    }
+  }
+
+  private fun copyUriToFile(uri: Uri, dest: File) {
+    dest.parentFile?.mkdirs()
+    reactContext.contentResolver.openInputStream(uri).use { input ->
+      if (input == null) throw IllegalArgumentException("Could not open source document")
+      FileOutputStream(dest).use { output -> input.copyTo(output) }
+    }
+  }
+
+  private fun pdfPageCount(file: File): Int {
+    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+      PdfRenderer(pfd).use { return it.pageCount }
+    }
+  }
+
+  /** Unzips every EPUB entry to [destDir] and returns the spine chapters as relative paths. */
+  private fun unzipEpubToDir(epub: File, destDir: File): List<String> {
+    destDir.deleteRecursively()
+    destDir.mkdirs()
+    val canonicalRoot = destDir.canonicalPath
+    epub.inputStream().use { fileInput ->
+      ZipInputStream(fileInput).use { zip ->
+        var entry = zip.nextEntry
+        while (entry != null) {
+          if (!entry.isDirectory) {
+            val outFile = File(destDir, entry.name)
+            if (outFile.canonicalPath.startsWith(canonicalRoot)) {
+              outFile.parentFile?.mkdirs()
+              FileOutputStream(outFile).use { out -> zip.copyTo(out) }
+            }
+          }
+          zip.closeEntry()
+          entry = zip.nextEntry
+        }
+      }
+    }
+    return computeSpineFromDir(destDir)
+  }
+
+  private fun computeSpineFromDir(dir: File): List<String> {
+    val container = File(dir, "META-INF/container.xml")
+    if (!container.exists()) return fallbackHtmlList(dir)
+    val opfPath = parseContainerOpfPath(container.readText()) ?: return fallbackHtmlList(dir)
+    val opfFile = File(dir, opfPath)
+    if (!opfFile.exists()) return fallbackHtmlList(dir)
+    val parsed = parseOpf(opfFile.readText())
+    val basePath = opfPath.substringBeforeLast('/', "")
+    val spine = parsed.spine
+      .mapNotNull { idRef -> parsed.manifest[idRef] }
+      .map { item -> joinEpubPath(basePath, item.href) }
+      .filter { rel -> File(dir, rel).exists() && rel.isHtmlPath() }
+    return spine.ifEmpty { fallbackHtmlList(dir) }
+  }
+
+  private fun fallbackHtmlList(dir: File): List<String> =
+    dir.walkTopDown()
+      .filter { it.isFile && it.path.isHtmlPath() }
+      .map { it.relativeTo(dir).path }
+      .sorted()
+      .toList()
+
+  private fun sourceFile(id: String): File = File(libraryRoot(), "$id.src")
+
+  private fun epubDir(id: String): File = File(libraryRoot(), "${id}_book")
+
+  private fun renderedPagesDir(id: String): File = File(reactContext.cacheDir, "pdf_pages/$id")
+
+  private fun clearRenderedPages(id: String) {
+    renderedPagesDir(id).deleteRecursively()
+  }
+
+  private fun pngDimensions(file: File): Pair<Int, Int> {
+    val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    android.graphics.BitmapFactory.decodeFile(file.absolutePath, options)
+    return options.outWidth to options.outHeight
   }
 
   private fun extract(uri: Uri) = when (val name = displayName(uri)) {

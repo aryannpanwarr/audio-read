@@ -335,18 +335,34 @@ class SystemTtsModule(
     putString("model", "Android System TTS")
     putString("engine", engine?.defaultEngine ?: "")
     val voices = Arguments.createArray()
-    engine?.voices
-      ?.filter { !it.isNetworkConnectionRequired && it.locale.language.equals("en", ignoreCase = true) }
-      ?.sortedWith(compareBy({ !it.locale.language.equals("en", ignoreCase = true) }, { it.locale.toLanguageTag() }, { it.name }))
-      ?.take(30)
-      ?.forEach { voice ->
-        voices.pushMap(Arguments.createMap().apply {
-          putString("name", voice.name)
-          putString("locale", voice.locale.toLanguageTag())
-          putString("label", voiceLabel(voice.locale, voice.name))
-          putInt("quality", voice.quality)
-        })
-      }
+    val allEnglish = engine?.voices
+      ?.filter { it.locale.language.equals("en", ignoreCase = true) && !it.isUnusableVoice() }
+      .orEmpty()
+    // The app ships without INTERNET permission, so network voices cannot speak.
+    // Show local English voices; only fall back to network voices if no local ones exist.
+    val localEnglish = allEnglish.filter { !it.isNetworkConnectionRequired }
+    val englishVoices = (if (localEnglish.isNotEmpty()) localEnglish else allEnglish)
+      .sortedWith(
+        // en-US first, local before network, higher quality first, then stable by name
+        compareBy(
+          { !it.locale.country.equals("US", ignoreCase = true) },
+          { it.isNetworkConnectionRequired },
+          { -it.quality },
+          { it.locale.toLanguageTag() },
+          { it.name },
+        ),
+      )
+    englishVoices.forEach { voice ->
+      voices.pushMap(Arguments.createMap().apply {
+        putString("name", voice.name)
+        putString("locale", voice.locale.toLanguageTag())
+        putString("label", voiceLabel(voice.locale, voice.name))
+        putInt("quality", voice.quality)
+        putBoolean("requiresNetwork", voice.isNetworkConnectionRequired)
+        putBoolean("isLocal", !voice.isNetworkConnectionRequired)
+      })
+    }
+    LogStore.write(TAG, "systemInfo englishVoices=${englishVoices.size} local=${englishVoices.count { !it.isNetworkConnectionRequired }}")
     putArray("voices", voices)
   }
 
@@ -359,15 +375,20 @@ class SystemTtsModule(
   }
 
   private fun setDefaultEnglishVoice(engine: TextToSpeech) {
-    val voices = engine.voices.orEmpty().filter { !it.isNetworkConnectionRequired }
-    val preferred = voices.firstOrNull { it.name == "en-us-x-tpf-local" }
-      ?: voices.firstOrNull { it.locale.toLanguageTag().equals("en-US", ignoreCase = true) }
-      ?: voices.firstOrNull { it.locale.language.equals("en", ignoreCase = true) }
+    val all = engine.voices.orEmpty().filterNot { it.isUnusableVoice() }
+    val local = all.filter { !it.isNetworkConnectionRequired }
+    // Prefer a local en-US voice, then any local English, then any English voice at all.
+    val preferred = local.firstOrNull { it.locale.country.equals("US", ignoreCase = true) && it.locale.language.equals("en", ignoreCase = true) }
+      ?: local.firstOrNull { it.locale.language.equals("en", ignoreCase = true) }
+      ?: all.firstOrNull { it.locale.country.equals("US", ignoreCase = true) && it.locale.language.equals("en", ignoreCase = true) }
+      ?: all.firstOrNull { it.locale.language.equals("en", ignoreCase = true) }
     if (preferred != null) {
       engine.voice = preferred
       engine.language = preferred.locale
+      LogStore.write(TAG, "default voice selected name=${preferred.name} locale=${preferred.locale.toLanguageTag()} network=${preferred.isNetworkConnectionRequired}")
     } else {
       engine.language = Locale.US
+      LogStore.write(TAG, "default voice fallback to Locale.US")
     }
   }
 
@@ -434,10 +455,24 @@ private fun estimateDurationSeconds(text: String, speed: Double): Double {
 private fun String.wordCount(): Int =
   trim().split(Regex("\\s+")).count { it.isNotBlank() }
 
+private fun android.speech.tts.Voice.isUnusableVoice(): Boolean {
+  if (quality < android.speech.tts.Voice.QUALITY_VERY_LOW) return true
+  val features = features ?: return false
+  return features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
+}
+
 private fun voiceLabel(locale: Locale, name: String): String {
-  val country = locale.getDisplayCountry(Locale.US).ifBlank { locale.toLanguageTag() }
-  val variant = name.substringAfterLast('-', "").replaceFirstChar { char ->
-    if (char.isLowerCase()) char.titlecase(Locale.US) else char.toString()
+  val language = locale.getDisplayLanguage(Locale.US).ifBlank { locale.language }
+  val country = when {
+    locale.country.isBlank() -> ""
+    else -> " (${locale.country.uppercase(Locale.US)})"
   }
-  return "$country · $variant"
+  // Pull a short, human-ish variant tag from the engine voice name, e.g.
+  // "en-us-x-sfg-local" -> "sfg", "en-US-language" -> "language".
+  val variant = name
+    .substringAfterLast("-x-", name.substringAfterLast('-', ""))
+    .removeSuffix("-local")
+    .removeSuffix("-network")
+    .ifBlank { "default" }
+  return "$language$country · $variant"
 }
