@@ -69,9 +69,9 @@ class SystemTtsModule(
     if (status == TextToSpeech.SUCCESS) {
       val engine = tts
       ready = true
-      engine?.language = Locale.getDefault()
+      engine?.let { setDefaultEnglishVoice(it) }
       engine?.setOnUtteranceProgressListener(listener)
-      LogStore.write(TAG, "system tts initialized engine=${engine?.defaultEngine}")
+      LogStore.write(TAG, "system tts initialized engine=${engine?.defaultEngine} voice=${engine?.voice?.name}")
       val result = systemInfo()
       synchronized(initPromises) {
         initPromises.forEach { it.resolve(result) }
@@ -136,7 +136,7 @@ class SystemTtsModule(
           utterances.remove(utteranceId)
           promise.reject("SYSTEM_TTS_SPEAK_FAILED", "Android system TTS rejected the utterance")
         } else {
-          LogStore.write(TAG, "speak started chars=${cleanText.length} words=${cleanText.wordCount()} speed=$speed voice=${voiceName.orEmpty()}")
+          LogStore.write(TAG, "speak started chars=${cleanText.length} words=${cleanText.wordCount()} speed=$speed voice=${engine.voice?.name.orEmpty()}")
         }
       },
       onError = { error -> promise.reject("SYSTEM_TTS_INIT_FAILED", error.message, error) },
@@ -336,13 +336,14 @@ class SystemTtsModule(
     putString("engine", engine?.defaultEngine ?: "")
     val voices = Arguments.createArray()
     engine?.voices
-      ?.filter { !it.isNetworkConnectionRequired }
-      ?.sortedBy { it.name }
-      ?.take(50)
+      ?.filter { !it.isNetworkConnectionRequired && it.locale.language.equals("en", ignoreCase = true) }
+      ?.sortedWith(compareBy({ !it.locale.language.equals("en", ignoreCase = true) }, { it.locale.toLanguageTag() }, { it.name }))
+      ?.take(30)
       ?.forEach { voice ->
         voices.pushMap(Arguments.createMap().apply {
           putString("name", voice.name)
           putString("locale", voice.locale.toLanguageTag())
+          putString("label", voiceLabel(voice.locale, voice.name))
           putInt("quality", voice.quality)
         })
       }
@@ -350,8 +351,24 @@ class SystemTtsModule(
   }
 
   private fun selectVoice(engine: TextToSpeech, voiceName: String?) {
-    if (voiceName.isNullOrBlank()) return
-    engine.voices?.firstOrNull { it.name == voiceName }?.let { engine.voice = it }
+    if (voiceName.isNullOrBlank()) {
+      setDefaultEnglishVoice(engine)
+      return
+    }
+    engine.voices?.firstOrNull { it.name == voiceName }?.let { engine.voice = it } ?: setDefaultEnglishVoice(engine)
+  }
+
+  private fun setDefaultEnglishVoice(engine: TextToSpeech) {
+    val voices = engine.voices.orEmpty().filter { !it.isNetworkConnectionRequired }
+    val preferred = voices.firstOrNull { it.name == "en-us-x-tpf-local" }
+      ?: voices.firstOrNull { it.locale.toLanguageTag().equals("en-US", ignoreCase = true) }
+      ?: voices.firstOrNull { it.locale.language.equals("en", ignoreCase = true) }
+    if (preferred != null) {
+      engine.voice = preferred
+      engine.language = preferred.locale
+    } else {
+      engine.language = Locale.US
+    }
   }
 
   private fun emitPlaybackCommand(command: String) {
@@ -416,3 +433,11 @@ private fun estimateDurationSeconds(text: String, speed: Double): Double {
 
 private fun String.wordCount(): Int =
   trim().split(Regex("\\s+")).count { it.isNotBlank() }
+
+private fun voiceLabel(locale: Locale, name: String): String {
+  val country = locale.getDisplayCountry(Locale.US).ifBlank { locale.toLanguageTag() }
+  val variant = name.substringAfterLast('-', "").replaceFirstChar { char ->
+    if (char.isLowerCase()) char.titlecase(Locale.US) else char.toString()
+  }
+  return "$country · $variant"
+}

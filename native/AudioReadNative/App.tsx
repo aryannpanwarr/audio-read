@@ -19,6 +19,7 @@ type TtsVoice = {
   name: string;
   locale: string;
   quality: number;
+  label?: string;
 };
 
 type InitResult = {
@@ -288,7 +289,7 @@ function App() {
     setStatus('Loading Android voice...');
     const info = await SystemTts.initialize();
     setReady(info);
-    setVoiceIndex(0);
+    setVoiceIndex(Math.max(0, info.voices?.findIndex(voice => voice.locale.toLowerCase().startsWith('en')) ?? 0));
     setStatus(`System TTS ready${info.engine ? ` · ${info.engine}` : ''}`);
     return info;
   }, [ready]);
@@ -730,7 +731,7 @@ function App() {
                 <Text style={styles.stepperText}>-</Text>
               </Pressable>
               <Text style={styles.optionValue} numberOfLines={1}>
-                {voices[voiceIndex]?.locale ?? 'System'}
+                {voices[voiceIndex]?.label ?? voices[voiceIndex]?.locale ?? 'System'}
               </Text>
               <Pressable
                 onPress={() => setVoiceIndex(Math.min(Math.max(0, voices.length - 1), voiceIndex + 1))}
