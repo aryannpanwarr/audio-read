@@ -135,6 +135,7 @@ const VOICES = [
 const INITIAL_BUFFER_SECONDS = 18;
 const BACKGROUND_BUFFER_SECONDS = 240;
 const LIBRARY_PREP_SECONDS = 600;
+const LIBRARY_READY_SECONDS = 60;
 const MAX_BUFFER_SENTENCES = 160;
 
 const describeError = (error: unknown) => {
@@ -359,7 +360,11 @@ function App() {
         `ui prebuffer done label=${label} generated=${result.generated} cacheHits=${result.cacheHits} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
       );
       if (visible) {
-        setStatus(`Prepared ${formatDuration(result.audioDurationSeconds)} audio`);
+        setStatus(
+          result.audioDurationSeconds >= 1
+            ? `Prepared ${formatDuration(result.audioDurationSeconds)} audio`
+            : 'Caching paused',
+        );
       }
       return result;
     } finally {
@@ -412,13 +417,17 @@ function App() {
           `ui library prepare done title=${book.title} audio=${result.audioDurationSeconds.toFixed(3)}s elapsed=${result.elapsedSeconds.toFixed(3)}s`,
         );
         setCacheStatus(`${formatDuration(result.audioDurationSeconds)} cached`);
+        const isReady = result.audioDurationSeconds >= LIBRARY_READY_SECONDS;
         void DocumentReader.updateLibraryDocument(book.id, {
-          cacheStatus: 'ready',
+          cacheStatus: isReady ? 'ready' : 'preparing',
           preparedAudioSeconds: result.audioDurationSeconds,
         })
           .then(updateBookInState)
           .catch(error => recordLog(`ui library prepare metadata update failed ${describeError(error)}`));
-        return KokoroTts.notifyPreparationDone(book.title, result.audioDurationSeconds);
+        if (isReady) {
+          return KokoroTts.notifyPreparationDone(book.title, result.audioDurationSeconds);
+        }
+        return undefined;
       })
       .catch(error => {
         void DocumentReader.updateLibraryDocument(book.id, {cacheStatus: 'failed'}).then(updateBookInState).catch(() => {});
@@ -599,7 +608,13 @@ function App() {
       await KokoroTts.stopPlaybackSession();
       clearWordProgress();
       backgroundBufferingRef.current = false;
-      setStatus('Paused');
+      setStatus('Paused · caching continues');
+      if (activeBookId) {
+        const activeBook = library.find(item => item.id === activeBookId);
+        if (activeBook) {
+          startDocumentPreparation(sentences, activeBook, current);
+        }
+      }
       return;
     }
     recordLog(`ui play pressed current=${current}`);
@@ -685,7 +700,7 @@ function App() {
             {cached
               ? `${formatDuration(item.preparedAudioSeconds)} cached`
               : item.cacheStatus === 'preparing'
-                ? 'Caching in background'
+                ? `Caching · ${formatDuration(item.preparedAudioSeconds)} cached`
                 : 'Cache pending'}
           </Text>
         </View>
@@ -766,7 +781,7 @@ function App() {
 
         <View style={styles.libraryFooter}>
           <Text style={styles.status} numberOfLines={2}>
-            {status}
+            {cacheStatus || status}
           </Text>
           <Pressable style={styles.logButtonWide} onPress={exportLogs}>
             <Text style={styles.logButtonText}>Export Logs</Text>

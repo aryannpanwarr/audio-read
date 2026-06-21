@@ -411,7 +411,22 @@ class KokoroTtsModule(
     }
     prebufferEpoch.incrementAndGet()
     val generated = synchronized(generationLock) {
-      generateAudio(text, speakerId, speed, source = "fresh")
+      val cachedAfterWait = synchronized(audioCache) { audioCache.remove(key) }
+      if (cachedAfterWait != null) {
+        LogStore.write(TAG, "speak cache hit after wait chars=${text.length}")
+        cachedAfterWait.copy(source = "cache-after-wait")
+      } else {
+        val diskAfterWait = loadDiskAudio(key)
+        if (diskAfterWait != null) {
+          LogStore.write(TAG, "speak disk cache hit after wait chars=${text.length}")
+          synchronized(audioCache) {
+            putAudioCacheLocked(key, diskAfterWait)
+          }
+          diskAfterWait.copy(source = "disk-after-wait")
+        } else {
+          generateAudio(text, speakerId, speed, source = "fresh")
+        }
+      }
     }
     synchronized(audioCache) {
       audioCache.remove(key)
