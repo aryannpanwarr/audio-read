@@ -301,8 +301,6 @@ class DocumentModule(
         if (!dir.exists() || spine == null || spine.length() == 0) {
           throw IllegalStateException("EPUB render assets unavailable")
         }
-        val styleLinks = LinkedHashSet<String>()
-        val inlineStyles = StringBuilder()
         val body = StringBuilder()
         for (i in 0 until spine.length()) {
           val rel = spine.getString(i)
@@ -310,26 +308,19 @@ class DocumentModule(
           if (!file.exists()) continue
           val chapterDir = rel.substringBeforeLast('/', "")
           val raw = file.readText()
-          // Collect stylesheet links (rewritten to absolute) so shared CSS still applies.
-          Regex("(?is)<link\\b[^>]*rel=[\"']?stylesheet[\"']?[^>]*>").findAll(raw).forEach { m ->
-            val href = Regex("(?i)href=[\"']([^\"']+)[\"']").find(m.value)?.groupValues?.get(1)
-            if (!href.isNullOrBlank()) {
-              resolveEpubResource(dir, chapterDir, href)?.let { abs -> styleLinks.add(abs) }
-            }
-          }
-          Regex("(?is)<style\\b[^>]*>(.*?)</style>").findAll(raw).forEach { m ->
-            inlineStyles.append(rewriteCssUrls(dir, chapterDir, m.groupValues[1])).append('\n')
-          }
-          val bodyInner = Regex("(?is)<body\\b[^>]*>(.*?)</body>").find(raw)?.groupValues?.get(1) ?: raw
+          // Deliberately drop the EPUB's own CSS/scripts: combining many chapters'
+          // stylesheets jumbles the layout. We keep the original markup + images and
+          // apply clean reader typography in the WebView instead.
+          val bodyInner = (Regex("(?is)<body\\b[^>]*>(.*?)</body>").find(raw)?.groupValues?.get(1) ?: raw)
+            .replace(Regex("(?is)<style\\b[^>]*>.*?</style>"), " ")
+            .replace(Regex("(?is)<script\\b[^>]*>.*?</script>"), " ")
+            .replace(Regex("(?is)<link\\b[^>]*>"), " ")
           body.append("<section class=\"ar-chapter\" id=\"ar-ch-").append(i).append("\">")
           body.append(rewriteHtmlUrls(dir, chapterDir, bodyInner))
           body.append("</section>\n")
         }
-        val head = StringBuilder()
-        head.append("<meta charset=\"utf-8\">")
-        head.append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=4\">")
-        styleLinks.forEach { href -> head.append("<link rel=\"stylesheet\" href=\"").append(href).append("\">") }
-        if (inlineStyles.isNotEmpty()) head.append("<style>").append(inlineStyles).append("</style>")
+        val head = "<meta charset=\"utf-8\">" +
+          "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=4\">"
         val html = "<!DOCTYPE html><html><head>$head</head><body>$body</body></html>"
         LogStore.write(DOCUMENT_TAG, "epub combined html id=$id chapters=${spine.length()} bytes=${html.length}")
         promise.resolve(Arguments.createMap().apply {
