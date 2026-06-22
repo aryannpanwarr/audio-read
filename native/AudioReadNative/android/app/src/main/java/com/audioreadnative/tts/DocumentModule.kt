@@ -403,10 +403,16 @@ class DocumentModule(
           array.pushMap(Arguments.createMap().apply {
             putString("text", s.text)
             putInt("page", s.page)
-            putDouble("x", s.x.toDouble())
-            putDouble("y", s.y.toDouble())
-            putDouble("w", s.w.toDouble())
-            putDouble("h", s.h.toDouble())
+            val rects = Arguments.createArray()
+            s.rects.forEach { r ->
+              rects.pushMap(Arguments.createMap().apply {
+                putDouble("x", r.x.toDouble())
+                putDouble("y", r.y.toDouble())
+                putDouble("w", r.w.toDouble())
+                putDouble("h", r.h.toDouble())
+              })
+            }
+            putArray("rects", rects)
           })
         }
         LogStore.write(DOCUMENT_TAG, "pdf sentence boxes id=$id count=${sentences.size}")
@@ -420,41 +426,27 @@ class DocumentModule(
 
   /**
    * Walks the captured glyph stream, rebuilds sentences (terminator split, short
-   * fragments merged to >= 45 chars to mirror the JS splitter), and unions each
-   * sentence's glyph boxes into one normalized rectangle on its starting page.
+   * fragments merged to >= 45 chars to mirror the JS splitter), and emits ONE tight
+   * rectangle per visual line of the sentence on its starting page. Per-line rects
+   * (rather than one union box) keep wrapped/multi-line sentences hugging the text
+   * instead of covering whole blocks of empty space.
    */
   private fun buildPdfSentences(glyphs: List<GlyphStripper.Glyph>): List<PdfSentence> {
     val out = ArrayList<PdfSentence>()
     val sb = StringBuilder()
     var page = -1
-    var minX = Float.MAX_VALUE
-    var minY = Float.MAX_VALUE
-    var maxX = -Float.MAX_VALUE
-    var maxY = -Float.MAX_VALUE
+    val pending = ArrayList<GlyphStripper.Glyph>()
     var lastSpace = true
 
-    fun reset() {
-      sb.setLength(0); page = -1
-      minX = Float.MAX_VALUE; minY = Float.MAX_VALUE
-      maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
-      lastSpace = true
-    }
     fun flush() {
       val t = sb.toString().trim()
       if (t.length >= 2 && t.any { it.isLetterOrDigit() } && !isPageNumber(t)) {
-        val has = maxX > minX && maxY > minY
-        out.add(
-          PdfSentence(
-            text = t,
-            page = if (page < 0) 0 else page,
-            x = (if (has) minX else 0f).coerceIn(0f, 1f),
-            y = (if (has) minY else 0f).coerceIn(0f, 1f),
-            w = (if (has) maxX - minX else 0f).coerceIn(0f, 1f),
-            h = (if (has) maxY - minY else 0f).coerceIn(0f, 1f),
-          ),
-        )
+        val rects = groupLines(pending)
+        if (rects.isNotEmpty()) {
+          out.add(PdfSentence(t, if (page < 0) 0 else page, rects))
+        }
       }
-      reset()
+      sb.setLength(0); page = -1; pending.clear(); lastSpace = true
     }
 
     for (g in glyphs) {
@@ -464,18 +456,59 @@ class DocumentModule(
       }
       if (page < 0) page = g.page
       sb.append(g.c); lastSpace = false
-      if (g.page == page) {
-        if (g.x < minX) minX = g.x
-        if (g.y < minY) minY = g.y
-        if (g.x + g.w > maxX) maxX = g.x + g.w
-        if (g.y + g.h > maxY) maxY = g.y + g.h
-      }
+      // Only the glyphs on the sentence's starting page contribute to its boxes.
+      if (g.page == page) pending.add(g)
       if (g.c == '.' || g.c == '!' || g.c == '?') {
         if (sb.toString().trim().length >= 45) flush()
       }
     }
     flush()
     return if (out.size > 8000) out.subList(0, 8000) else out
+  }
+
+  /** Groups a sentence's glyphs into per-line tight bounding boxes (normalized 0..1). */
+  private fun groupLines(glyphs: List<GlyphStripper.Glyph>): List<LineRect> {
+    if (glyphs.isEmpty()) return emptyList()
+    val rects = ArrayList<LineRect>()
+    var minX = Float.MAX_VALUE
+    var minY = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE
+    var maxY = -Float.MAX_VALUE
+    var lineY = 0f
+    var started = false
+
+    fun push() {
+      if (started && maxX > minX && maxY > minY) {
+        rects.add(
+          LineRect(
+            minX.coerceIn(0f, 1f),
+            minY.coerceIn(0f, 1f),
+            (maxX - minX).coerceIn(0f, 1f),
+            (maxY - minY).coerceIn(0f, 1f),
+          ),
+        )
+      }
+      minX = Float.MAX_VALUE; minY = Float.MAX_VALUE
+      maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
+      started = false
+    }
+
+    for (g in glyphs) {
+      val tol = (if (g.h > 0f) g.h else 0.012f) * 0.6f
+      if (!started) {
+        started = true; lineY = g.y
+      } else if (kotlin.math.abs(g.y - lineY) > tol) {
+        // A vertical jump beyond ~half a line height means a new visual line.
+        push()
+        started = true; lineY = g.y
+      }
+      if (g.x < minX) minX = g.x
+      if (g.y < minY) minY = g.y
+      if (g.x + g.w > maxX) maxX = g.x + g.w
+      if (g.y + g.h > maxY) maxY = g.y + g.h
+    }
+    push()
+    return rects
   }
 
   private fun isPageNumber(t: String): Boolean =
@@ -765,13 +798,17 @@ class DocumentModule(
   }
 }
 
-private data class PdfSentence(
-  val text: String,
-  val page: Int,
+private data class LineRect(
   val x: Float,
   val y: Float,
   val w: Float,
   val h: Float,
+)
+
+private data class PdfSentence(
+  val text: String,
+  val page: Int,
+  val rects: List<LineRect>,
 )
 
 /**

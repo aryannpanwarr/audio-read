@@ -109,8 +109,9 @@ type DocumentReaderModule = {
   getPdfSentenceBoxes(id: string): Promise<PdfSentenceBox[]>;
 };
 
-// A sentence's normalized (0..1 of the page) bounding box on a given PDF page.
-type PdfBox = {page: number; x: number; y: number; w: number; h: number};
+// A sentence's per-line tight rectangles (normalized 0..1 of the page) on a PDF page.
+type PdfRect = {x: number; y: number; w: number; h: number};
+type PdfBox = {page: number; rects: PdfRect[]};
 type PdfSentenceBox = PdfBox & {text: string};
 
 const SystemTts = NativeModules.SystemTts as SystemTtsModule;
@@ -491,9 +492,7 @@ function App() {
             const parsed = boxed.map((b, id) => ({id, text: b.text}));
             setSentences(parsed);
             sentencesRef.current = parsed;
-            setPdfBoxes(
-              boxed.map(b => ({page: b.page, x: b.x, y: b.y, w: b.w, h: b.h})),
-            );
+            setPdfBoxes(boxed.map(b => ({page: b.page, rects: b.rects})));
             setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
             setStatus('Ready to read');
             recordLog(`ui pdf sentence boxes count=${boxed.length}`);

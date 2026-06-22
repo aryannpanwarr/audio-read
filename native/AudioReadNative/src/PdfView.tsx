@@ -24,7 +24,8 @@ type DocumentReaderModule = {
 
 const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
 
-type PdfBox = {page: number; x: number; y: number; w: number; h: number};
+type PdfRect = {x: number; y: number; w: number; h: number};
+type PdfBox = {page: number; rects: PdfRect[]};
 
 type PdfViewProps = {
   bookId: string;
@@ -110,22 +111,26 @@ function PdfPage({
             style={{width: displayWidth, height}}
             resizeMode="contain"
           />
-          {active && activeBox && activeBox.w > 0 && activeBox.h > 0 ? (
-            <View
-              pointerEvents="none"
-              style={[
-                styles.highlight,
-                {
-                  left: activeBox.x * displayWidth,
-                  top: activeBox.y * height,
-                  width: activeBox.w * displayWidth,
-                  height: activeBox.h * height,
-                  backgroundColor: colors.accent2 + '40',
-                  borderColor: colors.accent2,
-                },
-              ]}
-            />
-          ) : null}
+          {active && activeBox
+            ? activeBox.rects.map((r, i) =>
+                r.w > 0 && r.h > 0 ? (
+                  <View
+                    key={i}
+                    pointerEvents="none"
+                    style={[
+                      styles.highlight,
+                      {
+                        left: r.x * displayWidth,
+                        top: r.y * height,
+                        width: r.w * displayWidth,
+                        height: r.h * height,
+                        backgroundColor: colors.accent2 + '4D',
+                      },
+                    ]}
+                  />
+                ) : null,
+              )
+            : null}
         </View>
       ) : (
         <View style={[styles.placeholder, {height: estimatedPageHeight}]}>
@@ -178,7 +183,11 @@ function PdfView({
     <FlatList
       ref={listRef}
       data={pages}
-      extraData={`${currentPage}:${activeBox ? `${activeBox.x},${activeBox.y}` : ''}`}
+      extraData={`${currentPage}:${
+        activeBox && activeBox.rects[0]
+          ? `${activeBox.rects[0].x},${activeBox.rects[0].y},${activeBox.rects.length}`
+          : ''
+      }`}
       keyExtractor={index => String(index)}
       style={{backgroundColor: colors.bg}}
       contentContainerStyle={styles.content}
@@ -233,8 +242,7 @@ const styles = StyleSheet.create({
   },
   highlight: {
     position: 'absolute',
-    borderRadius: 3,
-    borderWidth: 1.5,
+    borderRadius: 2,
   },
   readingBadge: {
     position: 'absolute',
