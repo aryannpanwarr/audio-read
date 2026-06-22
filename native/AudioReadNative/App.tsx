@@ -1002,32 +1002,36 @@ function App() {
             activeWordIndex={activeWordCount - 1}
             colors={colors}
             onSeekToPoint={(page, nx, ny) => {
-              // Seek to the paragraph the tap actually landed in; fall back to the first
-              // paragraph on that page, then to proportional paging.
-              const hit = pdfBoxes.findIndex(
-                b =>
-                  b != null &&
-                  b.page === page &&
-                  b.rects.some(
-                    r => nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h,
-                  ),
+              // Match by vertical row (paragraphs are full-width blocks), so tapping
+              // anywhere on a line works — not just on the ragged text rectangle.
+              const onPage = pdfBoxes
+                .map((b, i) => ({b, i}))
+                .filter(o => o.b != null && o.b.page === page);
+              let hit = onPage.find(o =>
+                o.b!.rects.some(r => ny >= r.y - 0.006 && ny <= r.y + r.h + 0.006),
               );
-              if (hit >= 0) {
-                recordLog(
-                  `pdf tap page=${page} nx=${nx.toFixed(3)} ny=${ny.toFixed(3)} -> hit unit=${hit}`,
-                );
-                skipTo(hit);
-                return;
+              // Otherwise snap to the nearest paragraph on the page by vertical center.
+              if (!hit && onPage.length) {
+                let bestD = Infinity;
+                for (const o of onPage) {
+                  const rects = o.b!.rects;
+                  const cy =
+                    rects.reduce((s, r) => s + (r.y + r.h / 2), 0) /
+                    Math.max(1, rects.length);
+                  const d = Math.abs(cy - ny);
+                  if (d < bestD) {
+                    bestD = d;
+                    hit = o;
+                  }
+                }
               }
-              const firstOnPage = pdfBoxes.findIndex(b => b != null && b.page === page);
-              const fallback =
-                firstOnPage >= 0
-                  ? firstOnPage
-                  : Math.floor((page / Math.max(1, pageCount)) * sentences.length);
+              const target =
+                hit?.i ??
+                Math.floor((page / Math.max(1, pageCount)) * sentences.length);
               recordLog(
-                `pdf tap page=${page} nx=${nx.toFixed(3)} ny=${ny.toFixed(3)} -> no hit, fallback unit=${fallback}`,
+                `pdf tap page=${page} nx=${nx.toFixed(3)} ny=${ny.toFixed(3)} -> unit=${target}`,
               );
-              skipTo(fallback);
+              skipTo(target);
             }}
             onError={handlePdfError}
           />

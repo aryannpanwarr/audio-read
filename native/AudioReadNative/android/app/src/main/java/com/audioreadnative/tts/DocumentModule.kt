@@ -517,7 +517,10 @@ class DocumentModule(
     }
 
     for (g in glyphs) {
-      if (g.sep) {
+      // PDFBox delivers most inter-word spaces as ordinary space glyphs inside
+      // writeString (not via writeWordSeparator), so split words on any whitespace
+      // too — otherwise a whole line collapses into one giant "word".
+      if (g.sep || g.c.isWhitespace()) {
         closeWord()
         continue
       }
