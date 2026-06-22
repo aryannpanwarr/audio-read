@@ -848,12 +848,12 @@ function App() {
     }
   };
 
-  const playEpubFromWord = async (paragraph: number, charOffset: number) => {
+  const playEpubFromWord = async (unit: number, charOffset: number) => {
     if (!sentences.length) return;
-    const bounded = Math.max(0, Math.min(sentences.length - 1, paragraph));
+    const bounded = Math.max(0, Math.min(sentences.length - 1, unit));
     const sentence = sentences[bounded];
     const boundedChar = Math.max(0, Math.min(sentence.text.length, charOffset));
-    recordLog(`ui epub word tap p=${paragraph} c=${charOffset} -> unit=${bounded} char=${boundedChar}`);
+    recordLog(`ui epub word tap unit=${unit} c=${charOffset} -> unit=${bounded} char=${boundedChar}`);
     playGeneration++;
     await SystemTts.stop();
     clearWordProgress();

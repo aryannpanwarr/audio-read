@@ -18,22 +18,22 @@ type EpubViewProps = {
   fontScale: number;
   lineSpacing: number;
   onSentences: (sentences: string[]) => void;
-  onSelectWord: (paragraph: number, charOffset: number) => void;
+  onSelectWord: (unit: number, charOffset: number) => void;
   onError?: (message: string) => void;
 };
 
-// Injected once the book loads. It groups the whole book's text into PARAGRAPH units
-// (one per block element), wraps every word in a span tagged with its paragraph index
-// (data-p) and char offset within that paragraph's text (data-c), reports the paragraph
-// texts to React Native (the single TTS source of truth), and exposes:
-//   arHighlight(p)       -> soft block highlight over paragraph p (+ autoscroll)
+// Injected once the book loads. It groups the whole book's text into sentence-like
+// units (ending at . ! ? or at a block boundary), wraps every word in a span tagged
+// with its unit index (data-p) and char offset within that unit's text (data-c),
+// reports those units to React Native (the single TTS source of truth), and exposes:
+//   arHighlight(p)       -> soft highlight over unit p (+ autoscroll)
 //   arHighlightWord(p,c) -> stronger highlight on the word at char offset c
 // Tapping a word posts {type:'tapWord', p, c} so RN can play from there.
 const buildInjectedScript = (dark: boolean) => `
 (function(){
   try {
     function post(obj){ window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(obj)); }
-    if (window.__arReady) { post({type:'sentences', list: window.__arParas || []}); return true; }
+    if (window.__arReady) { post({type:'sentences', list: window.__arUnits || []}); return true; }
 
     var vp = document.querySelector('meta[name="viewport"]');
     if (!vp) { vp = document.createElement('meta'); vp.setAttribute('name','viewport'); document.head.appendChild(vp); }
@@ -52,7 +52,7 @@ const buildInjectedScript = (dark: boolean) => `
       + 'body{padding:20px 22px 240px !important;font-size:1.18rem !important;line-height:1.75 !important;'
       + 'letter-spacing:0;font-family:Georgia,"Times New Roman",serif !important;color:' + FG + ' !important;}'
       + 'body *{color:' + FG + ' !important;}'
-      + 'body *:not(.ar-pactive):not(.ar-wactive){background-color:transparent !important;}'
+      + 'body *:not(.ar-uactive):not(.ar-wactive){background-color:transparent !important;}'
       + 'p{margin:0 0 1em !important;line-height:1.75 !important;text-indent:0 !important;}'
       + 'div,section,article,blockquote,figure,table,ul,ol,pre{margin:0 0 1em !important;}'
       + 'h1,h2,h3,h4,h5,h6{line-height:1.3 !important;margin:1.4em 0 .55em !important;font-weight:700 !important;}'
@@ -61,7 +61,7 @@ const buildInjectedScript = (dark: boolean) => `
       + 'a{text-decoration:none !important;}'
       + '.ar-chapter{display:block !important;margin:0 0 2.5em !important;}'
       + '.ar-w{transition:background-color .1s ease;border-radius:3px;}'
-      + '.ar-pactive{background-color:' + PARA_BG + ' !important;border-radius:6px;'
+      + '.ar-uactive{background-color:' + PARA_BG + ' !important;border-radius:4px;'
       + 'box-shadow:0 0 0 5px ' + PARA_BG + ' !important;}'
       + '.ar-wactive{background-color:' + WORD_BG + ' !important;}';
     document.head.appendChild(style);
@@ -84,25 +84,33 @@ const buildInjectedScript = (dark: boolean) => `
       if (!skip) textNodes.push(node);
     }
 
-    var paras = [], paraEls = [], curBlock = null, curIdx = -1, curText = '';
+    var units = [], curBlock = null, curIdx = 0, curText = '';
+    function finishUnit(){
+      var text = curText.trim();
+      if (text) { units[curIdx] = text; curIdx++; }
+      curText = '';
+    }
+    function appendSpace(frag){
+      if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
+        curText += ' ';
+        frag.appendChild(document.createTextNode(' '));
+      }
+    }
     textNodes.forEach(function(tn){
       var blk = blockOf(tn);
       if (blk !== curBlock) {
-        if (curIdx >= 0) paras[curIdx] = curText.trim();
-        curBlock = blk; curIdx++; curText = ''; paraEls[curIdx] = blk;
+        if (curBlock !== null) finishUnit();
+        curBlock = blk;
       }
       var text = tn.nodeValue, frag = document.createDocumentFragment();
       var re = /(\\s+)|(\\S+)/g, m;
       while ((m = re.exec(text))) {
         if (m[1]) {
-          if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
-            curText += ' '; frag.appendChild(document.createTextNode(' '));
-          }
+          if (curText.length) appendSpace(frag);
+          else frag.appendChild(document.createTextNode(' '));
         } else {
           var word = m[2];
-          if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
-            curText += ' '; frag.appendChild(document.createTextNode(' '));
-          }
+          appendSpace(frag);
           var span = document.createElement('span');
           span.className = 'ar-w';
           span.setAttribute('data-p', curIdx);
@@ -110,12 +118,13 @@ const buildInjectedScript = (dark: boolean) => `
           span.textContent = word;
           frag.appendChild(span);
           curText += word;
+          if (/[.!?]["')\\]]*$/.test(word)) finishUnit();
         }
       }
       if (tn.parentNode) tn.parentNode.replaceChild(frag, tn);
     });
-    if (curIdx >= 0) paras[curIdx] = curText.trim();
-    for (var i = 0; i < paras.length; i++) { if (paras[i] == null) paras[i] = ''; }
+    finishUnit();
+    for (var i = 0; i < units.length; i++) { if (units[i] == null) units[i] = ''; }
 
     document.body.addEventListener('click', function(e){
       var t = e.target;
@@ -139,13 +148,12 @@ const buildInjectedScript = (dark: boolean) => `
         + 'p,li,div,section,article,blockquote{line-height:' + lh + ' !important;}';
     };
 
-    window.__arParaEls = paraEls;
     window.arHighlight = function(p){
-      var prev = document.querySelector('.ar-pactive');
-      if (prev) prev.classList.remove('ar-pactive');
+      document.querySelectorAll('.ar-uactive').forEach(function(e){ e.classList.remove('ar-uactive'); });
       document.querySelectorAll('.ar-wactive').forEach(function(e){ e.classList.remove('ar-wactive'); });
-      var el = window.__arParaEls[p];
-      if (el) { el.classList.add('ar-pactive'); el.scrollIntoView({behavior:'smooth', block:'center'}); }
+      var spans = document.querySelectorAll('.ar-w[data-p="' + p + '"]');
+      spans.forEach(function(e){ e.classList.add('ar-uactive'); });
+      if (spans.length) spans[0].scrollIntoView({behavior:'smooth', block:'center'});
     };
     window.arHighlightWord = function(p, c){
       document.querySelectorAll('.ar-wactive').forEach(function(e){ e.classList.remove('ar-wactive'); });
@@ -160,8 +168,8 @@ const buildInjectedScript = (dark: boolean) => `
     };
 
     window.__arReady = true;
-    window.__arParas = paras;
-    post({type:'sentences', list: paras});
+    window.__arUnits = units;
+    post({type:'sentences', list: units});
   } catch (err) {
     window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({type:'error', message: String(err)}));
   }
@@ -186,7 +194,7 @@ function EpubView({
   const readyRef = useRef(false);
   const injected = useMemo(() => buildInjectedScript(dark), [dark]);
 
-  // Soft block highlight follows the active paragraph.
+  // Soft highlight follows the active sentence-like unit.
   useEffect(() => {
     if (!readyRef.current) return;
     webRef.current?.injectJavaScript(
