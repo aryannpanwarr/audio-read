@@ -455,8 +455,13 @@ class DocumentModule(
     var page = -1
     var lineY = 0f
     var lineH = 0f
-    var lineAdvance = 0f
     var hasLine = false
+
+    // The real, document-wide line spacing — measured up front because pdfbox's glyph
+    // height (~cap height) is smaller than the line advance, so a fixed multiple of it
+    // wrongly flags every normal line break as a new paragraph.
+    val medianAdvance = medianLineAdvance(glyphs)
+    val breakAdvance = if (medianAdvance > 0f) medianAdvance * 1.5f else Float.MAX_VALUE
 
     fun closeWord() {
       if (curWord.isEmpty()) return
@@ -497,7 +502,7 @@ class DocumentModule(
         }
       }
       pending.clear(); paraWords.clear(); page = -1
-      hasLine = false; lineAdvance = 0f
+      hasLine = false
     }
 
     for (g in glyphs) {
@@ -512,16 +517,12 @@ class DocumentModule(
           // Moved to a new visual line — is it a new paragraph or just the next line?
           val paragraphBreak = g.page != page ||
             advance < -tol * 0.5f || // jumped up -> new column / region
-            (lineAdvance > 0f && advance > lineAdvance * 1.6f) || // gap >> normal leading
-            (lineAdvance <= 0f && advance > tol * 2.2f) // first gap, clearly large
+            advance > breakAdvance // gap clearly larger than normal line spacing
           if (paragraphBreak && paraWords.isNotEmpty()) {
             flushPara()
           } else {
-            // Same paragraph, next line: a line break separates words.
+            // Same paragraph, next line: a line break still separates words.
             closeWord()
-            if (advance > 0f) {
-              lineAdvance = if (lineAdvance > 0f) lineAdvance * 0.5f + advance * 0.5f else advance
-            }
           }
         }
       }
@@ -536,6 +537,25 @@ class DocumentModule(
     }
     flushPara()
     return if (out.size > 8000) out.subList(0, 8000) else out
+  }
+
+  /** Median line-to-line vertical advance (normalized), the document's typical leading. */
+  private fun medianLineAdvance(glyphs: List<GlyphStripper.Glyph>): Float {
+    val advances = ArrayList<Float>()
+    var page = -1
+    var lineY = 0f
+    var has = false
+    for (g in glyphs) {
+      if (g.sep) continue
+      if (!has || g.page != page) { page = g.page; lineY = g.y; has = true; continue }
+      val adv = g.y - lineY
+      val h = if (g.h > 0f) g.h else 0.012f
+      if (adv > h * 0.5f) { advances.add(adv); lineY = g.y } // moved to next line
+      else if (adv < -h * 0.5f) { lineY = g.y } // jumped up (new column); don't record
+    }
+    if (advances.isEmpty()) return 0f
+    advances.sort()
+    return advances[advances.size / 2]
   }
 
   /** Joins a unit's words into one string and records each word's char span + box. */
