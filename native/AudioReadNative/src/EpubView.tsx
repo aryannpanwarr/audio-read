@@ -12,28 +12,29 @@ type EpubViewProps = {
   html: string;
   baseUrl: string;
   currentIndex: number;
+  activeWordStart: number;
   dark: boolean;
   bg: string;
   fontScale: number;
   lineSpacing: number;
   onSentences: (sentences: string[]) => void;
-  onSelectSentence: (index: number) => void;
+  onSelectWord: (paragraph: number, charOffset: number) => void;
   onError?: (message: string) => void;
 };
 
-// Injected into each chapter once it loads. It wraps every run of text in a span
-// tagged with a running sentence index (preserving the original inline markup),
-// reports the resulting sentence list to React Native, and exposes a highlight
-// helper that React Native calls as the speech progresses.
+// Injected once the book loads. It groups the whole book's text into PARAGRAPH units
+// (one per block element), wraps every word in a span tagged with its paragraph index
+// (data-p) and char offset within that paragraph's text (data-c), reports the paragraph
+// texts to React Native (the single TTS source of truth), and exposes:
+//   arHighlight(p)       -> soft block highlight over paragraph p (+ autoscroll)
+//   arHighlightWord(p,c) -> stronger highlight on the word at char offset c
+// Tapping a word posts {type:'tapWord', p, c} so RN can play from there.
 const buildInjectedScript = (dark: boolean) => `
 (function(){
   try {
-    if (window.__arReady) { post({type:'sentences', list: window.__arSentences || []}); return true; }
     function post(obj){ window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(obj)); }
-    window.__arPost = post;
+    if (window.__arReady) { post({type:'sentences', list: window.__arParas || []}); return true; }
 
-    // EPUB XHTML usually has no mobile viewport, so the WebView renders it at a wide
-    // desktop width and shrinks it -> tiny text. Force a device-width viewport.
     var vp = document.querySelector('meta[name="viewport"]');
     if (!vp) { vp = document.createElement('meta'); vp.setAttribute('name','viewport'); document.head.appendChild(vp); }
     vp.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=4');
@@ -41,91 +42,94 @@ const buildInjectedScript = (dark: boolean) => `
     var FG = ${dark} ? '#f4f6f2' : '#1d2423';
     var BG = ${dark} ? '#101312' : '#f6f7f4';
     var LINK = ${dark} ? '#2dd4bf' : '#0f766e';
-    var HL_BG = ${dark} ? '#a87a14' : '#ffd24d';
-    var HL_FG = ${dark} ? '#0b0b0b' : '#1d2423';
-    // Clean "reader mode" typography. The EPUB's own CSS is stripped server-side, so
-    // these rules fully control layout -> consistent spacing, single column, no
-    // overlapping/absolutely-positioned text.
+    var PARA_BG = 'rgba(74,144,255,0.16)';
+    var WORD_BG = 'rgba(74,144,255,0.42)';
     var style = document.createElement('style');
     style.textContent = ''
       + 'html{-webkit-text-size-adjust:100%;text-size-adjust:100%;}'
-      + '*{position:static !important;float:none !important;max-width:100% !important;'
-      + 'box-sizing:border-box !important;}'
+      + '*{position:static !important;float:none !important;max-width:100% !important;box-sizing:border-box !important;}'
       + 'html,body{margin:0 !important;padding:0 !important;background:' + BG + ' !important;}'
-      + 'body{padding:20px 22px 200px !important;font-size:1.18rem !important;'
-      + 'line-height:1.75 !important;letter-spacing:0;'
-      + 'font-family:Georgia,"Times New Roman",serif !important;'
-      + 'color:' + FG + ' !important;}'
-      + 'body *:not(.ar-active){color:' + FG + ' !important;background:transparent !important;}'
+      + 'body{padding:20px 22px 240px !important;font-size:1.18rem !important;line-height:1.75 !important;'
+      + 'letter-spacing:0;font-family:Georgia,"Times New Roman",serif !important;color:' + FG + ' !important;}'
+      + 'body *{color:' + FG + ' !important;}'
+      + 'body *:not(.ar-pactive):not(.ar-wactive){background-color:transparent !important;}'
       + 'p{margin:0 0 1em !important;line-height:1.75 !important;text-indent:0 !important;}'
       + 'div,section,article,blockquote,figure,table,ul,ol,pre{margin:0 0 1em !important;}'
-      + 'h1,h2,h3,h4,h5,h6{line-height:1.3 !important;margin:1.4em 0 .55em !important;'
-      + 'font-weight:700 !important;}'
+      + 'h1,h2,h3,h4,h5,h6{line-height:1.3 !important;margin:1.4em 0 .55em !important;font-weight:700 !important;}'
       + 'li{margin:0 0 .45em !important;}'
-      + 'img,svg,image{display:block !important;margin:1em auto !important;'
-      + 'max-width:100% !important;height:auto !important;}'
-      + 'a:not(.ar-active){color:' + LINK + ' !important;text-decoration:none !important;}'
+      + 'img,svg,image{display:block !important;margin:1em auto !important;max-width:100% !important;height:auto !important;}'
+      + 'a{text-decoration:none !important;}'
       + '.ar-chapter{display:block !important;margin:0 0 2.5em !important;}'
-      + '.ar-s{transition:background-color .12s ease;}'
-      + '.ar-active{background:' + HL_BG + ' !important;color:' + HL_FG + ' !important;'
-      + 'border-radius:4px;box-shadow:0 0 0 3px ' + HL_BG + ' !important;}';
+      + '.ar-w{transition:background-color .1s ease;border-radius:3px;}'
+      + '.ar-pactive{background-color:' + PARA_BG + ' !important;border-radius:6px;'
+      + 'box-shadow:0 0 0 5px ' + PARA_BG + ' !important;}'
+      + '.ar-wactive{background-color:' + WORD_BG + ' !important;}';
     document.head.appendChild(style);
 
-    var skipTags = {SCRIPT:1, STYLE:1, HEAD:1, NOSCRIPT:1};
-    var nodes = [];
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-    var node;
-    while ((node = walker.nextNode())) {
-      if (!node.nodeValue || !node.nodeValue.trim()) continue;
-      var p = node.parentNode, skip = false;
-      while (p) { if (skipTags[p.nodeName]) { skip = true; break; } p = p.parentNode; }
-      if (!skip) nodes.push(node);
+    var BLOCK = {P:1,LI:1,H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,BLOCKQUOTE:1,DIV:1,SECTION:1,
+      ARTICLE:1,TD:1,DD:1,DT:1,FIGCAPTION:1,PRE:1};
+    function blockOf(n){
+      var p = n.parentNode;
+      while (p && p !== document.body) { if (BLOCK[p.nodeName]) return p; p = p.parentNode; }
+      return document.body;
     }
 
-    var sentences = [];
-    var curIdx = 0;
-    var curText = '';
-    nodes.forEach(function(textNode){
-      var text = textNode.nodeValue;
-      var frag = document.createDocumentFragment();
-      var re = /[^.!?]*[.!?]+["')\\]]*|[^.!?]+$/g;
-      var pieces = text.match(re);
-      if (!pieces || !pieces.length) pieces = [text];
-      pieces.forEach(function(piece){
-        if (!piece) return;
-        var span = document.createElement('span');
-        span.className = 'ar-s';
-        span.setAttribute('data-s', curIdx);
-        span.textContent = piece;
-        frag.appendChild(span);
-        curText += piece;
-        // Only finish a sentence at a terminator once we have a reasonable chunk,
-        // so very short fragments merge instead of producing choppy mini-utterances.
-        if (/[.!?]["')\\]]*\\s*$/.test(piece) && curText.trim().length >= 40) {
-          sentences[curIdx] = curText.trim();
-          curIdx++; curText = '';
+    var skipTags = {SCRIPT:1, STYLE:1, HEAD:1, NOSCRIPT:1};
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    var node, textNodes = [];
+    while ((node = walker.nextNode())) {
+      if (!node.nodeValue || !node.nodeValue.trim()) continue;
+      var pp = node.parentNode, skip = false;
+      while (pp) { if (skipTags[pp.nodeName]) { skip = true; break; } pp = pp.parentNode; }
+      if (!skip) textNodes.push(node);
+    }
+
+    var paras = [], paraEls = [], curBlock = null, curIdx = -1, curText = '';
+    textNodes.forEach(function(tn){
+      var blk = blockOf(tn);
+      if (blk !== curBlock) {
+        if (curIdx >= 0) paras[curIdx] = curText.trim();
+        curBlock = blk; curIdx++; curText = ''; paraEls[curIdx] = blk;
+      }
+      var text = tn.nodeValue, frag = document.createDocumentFragment();
+      var re = /(\\s+)|(\\S+)/g, m;
+      while ((m = re.exec(text))) {
+        if (m[1]) {
+          if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
+            curText += ' '; frag.appendChild(document.createTextNode(' '));
+          }
+        } else {
+          var word = m[2];
+          if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
+            curText += ' '; frag.appendChild(document.createTextNode(' '));
+          }
+          var span = document.createElement('span');
+          span.className = 'ar-w';
+          span.setAttribute('data-p', curIdx);
+          span.setAttribute('data-c', curText.length);
+          span.textContent = word;
+          frag.appendChild(span);
+          curText += word;
         }
-      });
-      if (textNode.parentNode) textNode.parentNode.replaceChild(frag, textNode);
+      }
+      if (tn.parentNode) tn.parentNode.replaceChild(frag, tn);
     });
-    if (curText.trim()) { sentences[curIdx] = curText.trim(); curIdx++; }
-    for (var i = 0; i < curIdx; i++) { if (sentences[i] == null) sentences[i] = ''; }
+    if (curIdx >= 0) paras[curIdx] = curText.trim();
+    for (var i = 0; i < paras.length; i++) { if (paras[i] == null) paras[i] = ''; }
 
     document.body.addEventListener('click', function(e){
-      // Prevent internal chapter links from navigating away from the combined doc.
       var t = e.target;
       while (t && t !== document.body) {
         if (t.nodeName === 'A') { e.preventDefault(); }
-        if (t.getAttribute && t.getAttribute('data-s') != null) {
-          post({type:'tap', index: parseInt(t.getAttribute('data-s'), 10)});
+        if (t.classList && t.classList.contains('ar-w')) {
+          post({type:'tapWord', p: parseInt(t.getAttribute('data-p'), 10), c: parseInt(t.getAttribute('data-c'), 10)});
           return;
         }
         t = t.parentNode;
       }
     }, true);
 
-    // Live text-size / line-spacing control. A dedicated <style> appended after the
-    // base reader stylesheet wins, so RN can rescale typography without a reload.
+    // Live text-size / line-spacing override (wins over the base reader CSS).
     window.arSetType = function(fs, ls){
       var s = document.getElementById('ar-type-style');
       if (!s) { s = document.createElement('style'); s.id = 'ar-type-style'; document.head.appendChild(s); }
@@ -135,19 +139,29 @@ const buildInjectedScript = (dark: boolean) => `
         + 'p,li,div,section,article,blockquote{line-height:' + lh + ' !important;}';
     };
 
-    window.arHighlight = function(i){
-      var prev = document.querySelector('.ar-active');
-      if (prev) { document.querySelectorAll('.ar-active').forEach(function(e){e.classList.remove('ar-active');}); }
-      var els = document.querySelectorAll('[data-s="' + i + '"]');
-      if (els.length) {
-        els.forEach(function(e){ e.classList.add('ar-active'); });
-        els[0].scrollIntoView({behavior:'smooth', block:'center'});
+    window.__arParaEls = paraEls;
+    window.arHighlight = function(p){
+      var prev = document.querySelector('.ar-pactive');
+      if (prev) prev.classList.remove('ar-pactive');
+      document.querySelectorAll('.ar-wactive').forEach(function(e){ e.classList.remove('ar-wactive'); });
+      var el = window.__arParaEls[p];
+      if (el) { el.classList.add('ar-pactive'); el.scrollIntoView({behavior:'smooth', block:'center'}); }
+    };
+    window.arHighlightWord = function(p, c){
+      document.querySelectorAll('.ar-wactive').forEach(function(e){ e.classList.remove('ar-wactive'); });
+      if (c < 0) return;
+      var spans = document.querySelectorAll('.ar-w[data-p="' + p + '"]');
+      var target = null;
+      for (var i = 0; i < spans.length; i++) {
+        var sc = parseInt(spans[i].getAttribute('data-c'), 10);
+        if (sc <= c) target = spans[i]; else break;
       }
+      if (target) target.classList.add('ar-wactive');
     };
 
     window.__arReady = true;
-    window.__arSentences = sentences;
-    post({type:'sentences', list: sentences});
+    window.__arParas = paras;
+    post({type:'sentences', list: paras});
   } catch (err) {
     window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({type:'error', message: String(err)}));
   }
@@ -159,19 +173,20 @@ function EpubView({
   html,
   baseUrl,
   currentIndex,
+  activeWordStart,
   dark,
   bg,
   fontScale,
   lineSpacing,
   onSentences,
-  onSelectSentence,
+  onSelectWord,
   onError,
 }: EpubViewProps) {
   const webRef = useRef<any>(null);
   const readyRef = useRef(false);
   const injected = useMemo(() => buildInjectedScript(dark), [dark]);
 
-  // Re-highlight whenever the active sentence changes (and the book is ready).
+  // Soft block highlight follows the active paragraph.
   useEffect(() => {
     if (!readyRef.current) return;
     webRef.current?.injectJavaScript(
@@ -179,7 +194,15 @@ function EpubView({
     );
   }, [currentIndex]);
 
-  // Live-apply text size / line spacing changes once the book is ready.
+  // Stronger word highlight follows the exact spoken word (onRangeStart offset).
+  useEffect(() => {
+    if (!readyRef.current) return;
+    webRef.current?.injectJavaScript(
+      `window.arHighlightWord && window.arHighlightWord(${currentIndex}, ${activeWordStart}); true;`,
+    );
+  }, [currentIndex, activeWordStart]);
+
+  // Live-apply text size / line spacing once the book is ready.
   useEffect(() => {
     if (!readyRef.current) return;
     webRef.current?.injectJavaScript(
@@ -187,13 +210,10 @@ function EpubView({
     );
   }, [fontScale, lineSpacing]);
 
-  // Reset state when the book content changes.
   useEffect(() => {
     readyRef.current = false;
   }, [html]);
 
-  // Allow only the initial document (its URL equals baseUrl); block every chapter
-  // link / anchor navigation so tapping a link never replaces the scroll view.
   const handleShouldStart = useCallback(
     (req: {url?: string}) => {
       const url = req?.url ?? '';
@@ -209,19 +229,23 @@ function EpubView({
         const data = JSON.parse(event.nativeEvent.data) as {
           type: string;
           list?: string[];
-          index?: number;
+          p?: number;
+          c?: number;
           message?: string;
         };
         if (data.type === 'sentences' && data.list) {
           readyRef.current = true;
           onSentences(data.list);
-          // Apply current typography + highlight once content is ready.
           webRef.current?.injectJavaScript(
             `window.arSetType && window.arSetType(${fontScale}, ${lineSpacing});` +
               `window.arHighlight && window.arHighlight(${currentIndex}); true;`,
           );
-        } else if (data.type === 'tap' && typeof data.index === 'number') {
-          onSelectSentence(data.index);
+        } else if (
+          data.type === 'tapWord' &&
+          typeof data.p === 'number' &&
+          typeof data.c === 'number'
+        ) {
+          onSelectWord(data.p, data.c);
         } else if (data.type === 'error' && onError) {
           onError(data.message ?? 'EPUB render error');
         }
@@ -229,7 +253,7 @@ function EpubView({
         // Ignore malformed messages.
       }
     },
-    [currentIndex, fontScale, lineSpacing, onSentences, onSelectSentence, onError],
+    [currentIndex, fontScale, lineSpacing, onSentences, onSelectWord, onError],
   );
 
   return (

@@ -297,12 +297,14 @@ function App() {
   // Char offset of the word currently being spoken, into the active sentence's text
   // (from Android TTS onRangeStart). -1 = none. Used to highlight the exact word.
   const [activeWordStart, setActiveWordStart] = useState(-1);
+  const [activeWordBase, setActiveWordBase] = useState(0);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
   const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
   const wordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
+  const activeWordBaseRef = useRef(0);
   const backgroundPermissionPromptedRef = useRef(false);
   const sentencesResolveRef = useRef<((value: Sentence[]) => void) | null>(null);
 
@@ -320,15 +322,28 @@ function App() {
     }
     setActiveWordCount(0);
     setActiveWordStart(-1);
+    setActiveWordBase(0);
+    activeWordBaseRef.current = 0;
+  }
+
+  function updateActiveWordBase(offset: number) {
+    activeWordBaseRef.current = offset;
+    setActiveWordBase(offset);
   }
 
   function startWordProgress(timing: SpeechTiming) {
-    clearWordProgress();
+    if (wordTimerRef.current) {
+      clearInterval(wordTimerRef.current);
+      wordTimerRef.current = null;
+    }
+    setActiveWordCount(0);
+    setActiveWordStart(-1);
     const sentence = sentencesRef.current[currentRef.current];
     if (!sentence || timing.audioDurationSeconds <= 0) return;
+    const spokenText = sentence.text.slice(activeWordBaseRef.current);
     const wordCount = Math.max(
       1,
-      splitWords(sentence.text).filter(isWord).length || timing.wordCount,
+      splitWords(spokenText).filter(isWord).length || timing.wordCount,
     );
     const durationMs = Math.max(300, timing.audioDurationSeconds * 1000);
     const startedAt = Date.now();
@@ -728,7 +743,7 @@ function App() {
       .catch(error => recordLog(`ui progress update failed ${describeError(error)}`));
   };
 
-  const speakAt = async (startIndex: number) => {
+  const speakAt = async (startIndex: number, startCharOffset = 0) => {
     if (!sentencesRef.current.length && documentKind !== 'epub') return;
     const token = ++playGeneration;
     setPlaying(true);
@@ -763,7 +778,11 @@ function App() {
         persistProgress(index);
         setActiveWordCount(0);
         setActiveWordStart(-1);
-        const speakText = sentence.text.trim();
+        const requestedStart = index === startIndex ? startCharOffset : 0;
+        const safeStart = Math.max(0, Math.min(sentence.text.length, requestedStart));
+        const leadingWhitespace = sentence.text.slice(safeStart).match(/^\s*/)?.[0].length ?? 0;
+        updateActiveWordBase(safeStart + leadingWhitespace);
+        const speakText = sentence.text.slice(safeStart).trimStart();
         if (speakText.length < 2) {
           index += 1;
           continue;
@@ -827,6 +846,22 @@ function App() {
       await SystemTts.stopPlaybackSession();
       setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
     }
+  };
+
+  const playEpubFromWord = async (paragraph: number, charOffset: number) => {
+    if (!sentences.length) return;
+    const bounded = Math.max(0, Math.min(sentences.length - 1, paragraph));
+    const sentence = sentences[bounded];
+    const boundedChar = Math.max(0, Math.min(sentence.text.length, charOffset));
+    recordLog(`ui epub word tap p=${paragraph} c=${charOffset} -> unit=${bounded} char=${boundedChar}`);
+    playGeneration++;
+    await SystemTts.stop();
+    clearWordProgress();
+    setCurrent(bounded);
+    persistProgress(bounded);
+    setPlaying(false);
+    setBusy(false);
+    void speakAt(bounded, boundedChar);
   };
 
   useEffect(() => {
@@ -1261,12 +1296,13 @@ function App() {
             html={epubHtml}
             baseUrl={epubBaseUrl}
             currentIndex={current}
+            activeWordStart={activeWordStart >= 0 ? activeWordBase + activeWordStart : -1}
             dark={dark}
             bg={colors.bg}
             fontScale={fontScale}
             lineSpacing={lineSpacing}
             onSentences={handleEpubSentences}
-            onSelectSentence={skipTo}
+            onSelectWord={playEpubFromWord}
             onError={handleEpubError}
           />
         ) : documentKind === 'pdf' && pageCount > 0 && activeBookId ? (
