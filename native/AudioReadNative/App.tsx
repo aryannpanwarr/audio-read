@@ -106,7 +106,12 @@ type DocumentReaderModule = {
   deleteLibraryDocument(id: string): Promise<void>;
   getBookManifest(id: string): Promise<BookManifest>;
   getEpubCombinedHtml(id: string): Promise<{html: string; baseUrl: string}>;
+  getPdfSentenceBoxes(id: string): Promise<PdfSentenceBox[]>;
 };
+
+// A sentence's normalized (0..1 of the page) bounding box on a given PDF page.
+type PdfBox = {page: number; x: number; y: number; w: number; h: number};
+type PdfSentenceBox = PdfBox & {text: string};
 
 const SystemTts = NativeModules.SystemTts as SystemTtsModule;
 const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
@@ -261,6 +266,7 @@ function App() {
   const [epubHtml, setEpubHtml] = useState('');
   const [epubBaseUrl, setEpubBaseUrl] = useState('');
   const [pageCount, setPageCount] = useState(0);
+  const [pdfBoxes, setPdfBoxes] = useState<(PdfBox | null)[]>([]);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
   const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
@@ -386,10 +392,17 @@ function App() {
   }, [current, sentences.length]);
 
   const progress = sentences.length ? Math.round(((current + 1) / sentences.length) * 100) : 0;
+  // The active sentence's on-page rectangle (PDF only); drives both the exact page
+  // mapping and the highlight overlay. Falls back to proportional paging if absent.
+  const activePdfBox = documentKind === 'pdf' ? pdfBoxes[current] ?? null : null;
   const pdfCurrentPage =
-    pageCount > 0 && sentences.length > 0
-      ? Math.min(pageCount - 1, Math.floor((current / sentences.length) * pageCount))
-      : 0;
+    pageCount <= 0
+      ? 0
+      : activePdfBox
+        ? Math.min(pageCount - 1, Math.max(0, activePdfBox.page))
+        : sentences.length > 0
+          ? Math.min(pageCount - 1, Math.floor((current / sentences.length) * pageCount))
+          : 0;
 
   // Per-sentence word counts, used to estimate how long the whole book runs and how
   // much has been read so far (music-player style elapsed / total).
@@ -446,6 +459,7 @@ function App() {
     setEpubHtml('');
     setEpubBaseUrl('');
     setPageCount(0);
+    setPdfBoxes([]);
     setView('reader');
     if (book.kind === 'epub') {
       setSentences([]);
@@ -468,6 +482,28 @@ function App() {
         recordLog(`ui epub fallback to text reader ${describeError(error)}`);
       }
     } else {
+      // PDF: prefer the native glyph-boxed sentence list so the on-page highlight lines
+      // up exactly with what TTS reads; fall back to the plain-text splitter on failure.
+      if (book.kind === 'pdf') {
+        try {
+          const boxed = await DocumentReader.getPdfSentenceBoxes(book.id);
+          if (boxed.length) {
+            const parsed = boxed.map((b, id) => ({id, text: b.text}));
+            setSentences(parsed);
+            sentencesRef.current = parsed;
+            setPdfBoxes(
+              boxed.map(b => ({page: b.page, x: b.x, y: b.y, w: b.w, h: b.h})),
+            );
+            setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
+            setStatus('Ready to read');
+            recordLog(`ui pdf sentence boxes count=${boxed.length}`);
+            await loadPdfManifest(book);
+            return;
+          }
+        } catch (error) {
+          recordLog(`ui pdf sentence boxes failed ${describeError(error)}`);
+        }
+      }
       const parsed = splitSentences(text);
       setSentences(parsed);
       sentencesRef.current = parsed;
@@ -914,10 +950,16 @@ function App() {
             bookId={activeBookId}
             pageCount={pageCount}
             currentPage={pdfCurrentPage}
+            activeBox={activePdfBox}
             colors={colors}
-            onSelectPage={page =>
-              skipTo(Math.floor((page / Math.max(1, pageCount)) * sentences.length))
-            }
+            onSelectPage={page => {
+              const idx = pdfBoxes.findIndex(b => b && b.page === page);
+              skipTo(
+                idx >= 0
+                  ? idx
+                  : Math.floor((page / Math.max(1, pageCount)) * sentences.length),
+              );
+            }}
             onError={handlePdfError}
           />
         ) : (

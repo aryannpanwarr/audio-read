@@ -24,10 +24,13 @@ type DocumentReaderModule = {
 
 const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
 
+type PdfBox = {page: number; x: number; y: number; w: number; h: number};
+
 type PdfViewProps = {
   bookId: string;
   pageCount: number;
   currentPage: number;
+  activeBox?: PdfBox | null;
   colors: {
     bg: string;
     surface: string;
@@ -52,6 +55,7 @@ function PdfPage({
   pageIndex,
   total,
   active,
+  activeBox,
   colors,
   onError,
 }: {
@@ -59,6 +63,7 @@ function PdfPage({
   pageIndex: number;
   total: number;
   active: boolean;
+  activeBox?: PdfBox | null;
   colors: PdfViewProps['colors'];
   onError?: (message: string) => void;
 }) {
@@ -99,11 +104,29 @@ function PdfPage({
         </View>
       ) : null}
       {page ? (
-        <Image
-          source={{uri: page.uri}}
-          style={{width: displayWidth, height}}
-          resizeMode="contain"
-        />
+        <View style={{width: displayWidth, height}}>
+          <Image
+            source={{uri: page.uri}}
+            style={{width: displayWidth, height}}
+            resizeMode="contain"
+          />
+          {active && activeBox && activeBox.w > 0 && activeBox.h > 0 ? (
+            <View
+              pointerEvents="none"
+              style={[
+                styles.highlight,
+                {
+                  left: activeBox.x * displayWidth,
+                  top: activeBox.y * height,
+                  width: activeBox.w * displayWidth,
+                  height: activeBox.h * height,
+                  backgroundColor: colors.accent2 + '40',
+                  borderColor: colors.accent2,
+                },
+              ]}
+            />
+          ) : null}
+        </View>
       ) : (
         <View style={[styles.placeholder, {height: estimatedPageHeight}]}>
           {failed ? (
@@ -120,7 +143,15 @@ function PdfPage({
   );
 }
 
-function PdfView({bookId, pageCount, currentPage, colors, onSelectPage, onError}: PdfViewProps) {
+function PdfView({
+  bookId,
+  pageCount,
+  currentPage,
+  activeBox,
+  colors,
+  onSelectPage,
+  onError,
+}: PdfViewProps) {
   const listRef = useRef<FlatList<number>>(null);
 
   const pages = useMemo(
@@ -147,7 +178,7 @@ function PdfView({bookId, pageCount, currentPage, colors, onSelectPage, onError}
     <FlatList
       ref={listRef}
       data={pages}
-      extraData={currentPage}
+      extraData={`${currentPage}:${activeBox ? `${activeBox.x},${activeBox.y}` : ''}`}
       keyExtractor={index => String(index)}
       style={{backgroundColor: colors.bg}}
       contentContainerStyle={styles.content}
@@ -169,6 +200,7 @@ function PdfView({bookId, pageCount, currentPage, colors, onSelectPage, onError}
             pageIndex={item}
             total={pageCount}
             active={item === currentPage}
+            activeBox={item === currentPage ? activeBox : null}
             colors={colors}
             onError={onError}
           />
@@ -198,6 +230,11 @@ const styles = StyleSheet.create({
     fontSize: 11,
     paddingVertical: 4,
     fontVariant: ['tabular-nums'],
+  },
+  highlight: {
+    position: 'absolute',
+    borderRadius: 3,
+    borderWidth: 1.5,
   },
   readingBadge: {
     position: 'absolute',

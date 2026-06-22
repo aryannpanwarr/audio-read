@@ -20,7 +20,9 @@ import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
@@ -379,6 +381,107 @@ class DocumentModule(
     }.start()
   }
 
+  /**
+   * Extracts every PDF sentence together with the page + normalized bounding box of its
+   * glyphs, so the JS layer can paint a highlight rectangle over the active sentence on
+   * the rendered page (ReadEra / Speechify style) instead of marking the whole page.
+   * The sentence list is index-aligned with what TTS reads, so sentence i ↔ box i.
+   */
+  @ReactMethod
+  fun getPdfSentenceBoxes(id: String, promise: Promise) {
+    Thread {
+      try {
+        val src = sourceFile(id)
+        if (!src.exists()) throw IllegalStateException("PDF source unavailable")
+        val stripper = GlyphStripper().apply { sortByPosition = true }
+        src.inputStream().use { input ->
+          PDDocument.load(input).use { doc -> stripper.getText(doc) }
+        }
+        val sentences = buildPdfSentences(stripper.glyphs)
+        val array = Arguments.createArray()
+        sentences.forEach { s ->
+          array.pushMap(Arguments.createMap().apply {
+            putString("text", s.text)
+            putInt("page", s.page)
+            putDouble("x", s.x.toDouble())
+            putDouble("y", s.y.toDouble())
+            putDouble("w", s.w.toDouble())
+            putDouble("h", s.h.toDouble())
+          })
+        }
+        LogStore.write(DOCUMENT_TAG, "pdf sentence boxes id=$id count=${sentences.size}")
+        promise.resolve(array)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "getPdfSentenceBoxes failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("PDF_BOXES_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  /**
+   * Walks the captured glyph stream, rebuilds sentences (terminator split, short
+   * fragments merged to >= 45 chars to mirror the JS splitter), and unions each
+   * sentence's glyph boxes into one normalized rectangle on its starting page.
+   */
+  private fun buildPdfSentences(glyphs: List<GlyphStripper.Glyph>): List<PdfSentence> {
+    val out = ArrayList<PdfSentence>()
+    val sb = StringBuilder()
+    var page = -1
+    var minX = Float.MAX_VALUE
+    var minY = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE
+    var maxY = -Float.MAX_VALUE
+    var lastSpace = true
+
+    fun reset() {
+      sb.setLength(0); page = -1
+      minX = Float.MAX_VALUE; minY = Float.MAX_VALUE
+      maxX = -Float.MAX_VALUE; maxY = -Float.MAX_VALUE
+      lastSpace = true
+    }
+    fun flush() {
+      val t = sb.toString().trim()
+      if (t.length >= 2 && t.any { it.isLetterOrDigit() } && !isPageNumber(t)) {
+        val has = maxX > minX && maxY > minY
+        out.add(
+          PdfSentence(
+            text = t,
+            page = if (page < 0) 0 else page,
+            x = (if (has) minX else 0f).coerceIn(0f, 1f),
+            y = (if (has) minY else 0f).coerceIn(0f, 1f),
+            w = (if (has) maxX - minX else 0f).coerceIn(0f, 1f),
+            h = (if (has) maxY - minY else 0f).coerceIn(0f, 1f),
+          ),
+        )
+      }
+      reset()
+    }
+
+    for (g in glyphs) {
+      if (g.sep) {
+        if (!lastSpace) { sb.append(' '); lastSpace = true }
+        continue
+      }
+      if (page < 0) page = g.page
+      sb.append(g.c); lastSpace = false
+      if (g.page == page) {
+        if (g.x < minX) minX = g.x
+        if (g.y < minY) minY = g.y
+        if (g.x + g.w > maxX) maxX = g.x + g.w
+        if (g.y + g.h > maxY) maxY = g.y + g.h
+      }
+      if (g.c == '.' || g.c == '!' || g.c == '?') {
+        if (sb.toString().trim().length >= 45) flush()
+      }
+    }
+    flush()
+    return if (out.size > 8000) out.subList(0, 8000) else out
+  }
+
+  private fun isPageNumber(t: String): Boolean =
+    Regex("^(?:page\\s*)?\\d{1,4}$", RegexOption.IGNORE_CASE).matches(t) ||
+      Regex("^\\[?(?:pg|page)\\s*\\d{1,4}]?$", RegexOption.IGNORE_CASE).matches(t)
+
   private fun prepareRenderAssets(id: String, kind: String, uri: Uri, item: JSONObject) {
     when (kind) {
       "pdf" -> {
@@ -659,6 +762,66 @@ class DocumentModule(
     val array = JSONArray()
     items.forEach { array.put(it) }
     libraryIndexFile().writeText(array.toString())
+  }
+}
+
+private data class PdfSentence(
+  val text: String,
+  val page: Int,
+  val x: Float,
+  val y: Float,
+  val w: Float,
+  val h: Float,
+)
+
+/**
+ * PDFTextStripper that records every glyph's page + normalized position (origin
+ * top-left, 0..1 of the crop box) alongside the text, plus word/line separators, so
+ * sentences can be re-segmented and given bounding boxes downstream.
+ */
+private class GlyphStripper : PDFTextStripper() {
+  data class Glyph(
+    val c: Char,
+    val page: Int,
+    val x: Float,
+    val y: Float,
+    val w: Float,
+    val h: Float,
+    val sep: Boolean,
+  )
+
+  val glyphs = ArrayList<Glyph>()
+  private var pageW = 1f
+  private var pageH = 1f
+  private var pageIdx = 0
+
+  override fun startPage(page: PDPage) {
+    val box = page.cropBox
+    pageW = if (box.width > 0f) box.width else 1f
+    pageH = if (box.height > 0f) box.height else 1f
+    pageIdx = currentPageNo - 1
+    super.startPage(page)
+  }
+
+  override fun writeString(text: String, textPositions: List<TextPosition>) {
+    for (tp in textPositions) {
+      val uni = tp.unicode ?: continue
+      val nx = tp.xDirAdj / pageW
+      val ny = tp.yDirAdj / pageH
+      val nw = tp.widthDirAdj / pageW
+      val nh = tp.heightDir / pageH
+      for (ch in uni) {
+        glyphs.add(Glyph(ch, pageIdx, nx, ny, nw, nh, false))
+      }
+    }
+  }
+
+  override fun writeLineSeparator() {
+    glyphs.add(Glyph('\n', pageIdx, 0f, 0f, 0f, 0f, true))
+  }
+
+  override fun writeWordSeparator() {
+    glyphs.add(Glyph(' ', pageIdx, 0f, 0f, 0f, 0f, true))
   }
 }
 
