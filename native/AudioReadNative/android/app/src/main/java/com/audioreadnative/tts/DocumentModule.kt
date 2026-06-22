@@ -41,6 +41,7 @@ private const val DOCUMENT_PICK_REQUEST = 4207
 private const val DOCUMENT_TAG = "AudioReadDocument"
 private const val LIBRARY_DIR = "library"
 private const val LIBRARY_INDEX = "index.json"
+private const val FOLDERS_INDEX = "folders.json"
 
 class DocumentModule(
   private val reactContext: ReactApplicationContext
@@ -230,6 +231,111 @@ class DocumentModule(
       } catch (e: Throwable) {
         LogStore.write(DOCUMENT_TAG, "deleteLibraryDocument failed id=$id: ${e.stackTraceToString()}")
         promise.reject("LIBRARY_DELETE_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun listFolders(promise: Promise) {
+    Thread {
+      try {
+        val array = Arguments.createArray()
+        readFolders()
+          .sortedBy { it.optString("name").lowercase(Locale.US) }
+          .forEach { folder -> array.pushMap(folder.toWritableMap()) }
+        promise.resolve(array)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "listFolders failed: ${e.stackTraceToString()}")
+        promise.reject("FOLDER_LIST_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun createFolder(name: String, promise: Promise) {
+    Thread {
+      try {
+        val clean = name.trim().ifEmpty { "New folder" }
+        val folder = JSONObject().apply {
+          put("id", UUID.randomUUID().toString())
+          put("name", clean)
+          put("createdAt", System.currentTimeMillis())
+        }
+        val folders = readFolders().toMutableList()
+        folders.add(folder)
+        writeFolders(folders)
+        LogStore.write(DOCUMENT_TAG, "folder created id=${folder.optString("id")} name=$clean")
+        promise.resolve(folder.toWritableMap())
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "createFolder failed: ${e.stackTraceToString()}")
+        promise.reject("FOLDER_CREATE_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun renameFolder(id: String, name: String, promise: Promise) {
+    Thread {
+      try {
+        val folders = readFolders().toMutableList()
+        val index = folders.indexOfFirst { it.optString("id") == id }
+        if (index < 0) throw IllegalArgumentException("Folder not found")
+        folders[index].put("name", name.trim().ifEmpty { "Folder" })
+        writeFolders(folders)
+        promise.resolve(folders[index].toWritableMap())
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "renameFolder failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("FOLDER_RENAME_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  /** Deletes a folder; its books are moved back to the root (folderId cleared). */
+  @ReactMethod
+  fun deleteFolder(id: String, promise: Promise) {
+    Thread {
+      try {
+        val folders = readFolders().filterNot { it.optString("id") == id }
+        writeFolders(folders)
+        val items = readLibraryIndex().toMutableList()
+        var moved = 0
+        items.forEach { item ->
+          if (item.optString("folderId") == id) {
+            item.put("folderId", JSONObject.NULL)
+            item.put("updatedAt", System.currentTimeMillis())
+            moved++
+          }
+        }
+        writeLibraryIndex(items)
+        LogStore.write(DOCUMENT_TAG, "folder deleted id=$id booksMovedToRoot=$moved")
+        promise.resolve(null)
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "deleteFolder failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("FOLDER_DELETE_FAILED", e.message, e)
+      }
+    }.start()
+  }
+
+  /** Moves a book into a folder, or to the root when folderId is empty/null. */
+  @ReactMethod
+  fun moveDocument(id: String, folderId: String?, promise: Promise) {
+    Thread {
+      try {
+        val items = readLibraryIndex().toMutableList()
+        val index = items.indexOfFirst { it.optString("id") == id }
+        if (index < 0) throw IllegalArgumentException("Book not found in library")
+        if (folderId.isNullOrBlank()) {
+          items[index].put("folderId", JSONObject.NULL)
+        } else {
+          items[index].put("folderId", folderId)
+        }
+        items[index].put("updatedAt", System.currentTimeMillis())
+        writeLibraryIndex(items)
+        LogStore.write(DOCUMENT_TAG, "moveDocument id=$id folderId=${folderId ?: "root"}")
+        promise.resolve(items[index].toWritableMap())
+      } catch (e: Throwable) {
+        LogStore.write(DOCUMENT_TAG, "moveDocument failed id=$id: ${e.stackTraceToString()}")
+        promise.reject("DOCUMENT_MOVE_FAILED", e.message, e)
       }
     }.start()
   }
@@ -945,6 +1051,22 @@ class DocumentModule(
     val array = JSONArray()
     items.forEach { array.put(it) }
     libraryIndexFile().writeText(array.toString())
+  }
+
+  private fun foldersFile(): File = File(libraryRoot(), FOLDERS_INDEX)
+
+  private fun readFolders(): List<JSONObject> {
+    val file = foldersFile()
+    if (!file.exists()) return emptyList()
+    val array = JSONArray(file.readText())
+    return (0 until array.length()).map { array.getJSONObject(it) }
+  }
+
+  private fun writeFolders(folders: List<JSONObject>) {
+    libraryRoot().mkdirs()
+    val array = JSONArray()
+    folders.forEach { array.put(it) }
+    foldersFile().writeText(array.toString())
   }
 }
 

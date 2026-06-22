@@ -11,6 +11,7 @@ import {
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   View,
   useColorScheme,
 } from 'react-native';
@@ -69,6 +70,13 @@ type LibraryBook = {
   updatedAt: number;
   lastPosition: number;
   lastChapter?: number;
+  folderId?: string | null;
+};
+
+type Folder = {
+  id: string;
+  name: string;
+  createdAt: number;
 };
 
 type LoadedLibraryBook = LibraryBook & {
@@ -104,6 +112,11 @@ type DocumentReaderModule = {
   loadLibraryDocument(id: string): Promise<LoadedLibraryBook>;
   updateLibraryDocument(id: string, patch: Partial<LibraryBook>): Promise<LibraryBook>;
   deleteLibraryDocument(id: string): Promise<void>;
+  listFolders(): Promise<Folder[]>;
+  createFolder(name: string): Promise<Folder>;
+  renameFolder(id: string, name: string): Promise<Folder>;
+  deleteFolder(id: string): Promise<void>;
+  moveDocument(id: string, folderId: string | null): Promise<LibraryBook>;
   getBookManifest(id: string): Promise<BookManifest>;
   getEpubCombinedHtml(id: string): Promise<{html: string; baseUrl: string}>;
   getPdfSentenceBoxes(id: string): Promise<PdfSentenceBox[]>;
@@ -242,27 +255,6 @@ function formatTotalLength(seconds: number) {
   return 'under 1 min';
 }
 
-// Curated [top, bottom] tints for the auto-generated book covers. The cover color is
-// picked deterministically from the title so a book always looks the same.
-const COVER_PALETTE: [string, string][] = [
-  ['#0f766e', '#0b5a53'],
-  ['#b45309', '#8a3f08'],
-  ['#7c3aed', '#5b21b6'],
-  ['#be123c', '#911030'],
-  ['#1d4ed8', '#1a3fab'],
-  ['#047857', '#045f45'],
-  ['#c2410c', '#97330a'],
-  ['#0e7490', '#0c5d73'],
-];
-
-function coverFor(title: string) {
-  let h = 0;
-  for (let i = 0; i < title.length; i++) h = (h * 31 + title.charCodeAt(i)) >>> 0;
-  const [top, bottom] = COVER_PALETTE[h % COVER_PALETTE.length];
-  const letter = (title.trim().match(/[A-Za-z0-9]/)?.[0] ?? '?').toUpperCase();
-  return {top, bottom, letter};
-}
-
 function App() {
   const dark = useColorScheme() === 'dark';
   const colors = dark ? darkColors : lightColors;
@@ -270,6 +262,11 @@ function App() {
   const insets = useSafeAreaInsets();
 
   const [library, setLibrary] = useState<LibraryBook[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+  const [showNewFolder, setShowNewFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [moveBook, setMoveBook] = useState<LibraryBook | null>(null);
   const [view, setView] = useState<'library' | 'reader'>('library');
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [documentTitle, setDocumentTitle] = useState('');
@@ -343,11 +340,65 @@ function App() {
 
   const refreshLibrary = async () => {
     try {
-      const items = await DocumentReader.listLibrary();
+      const [items, folderList] = await Promise.all([
+        DocumentReader.listLibrary(),
+        DocumentReader.listFolders().catch(() => [] as Folder[]),
+      ]);
       setLibrary(items);
-      recordLog(`ui library loaded count=${items.length}`);
+      setFolders(folderList);
+      recordLog(`ui library loaded count=${items.length} folders=${folderList.length}`);
     } catch (error) {
       recordLog(`ui library load failed ${describeError(error)}`);
+    }
+  };
+
+  const createFolderNow = async () => {
+    const name = newFolderName.trim();
+    setShowNewFolder(false);
+    setNewFolderName('');
+    if (!name) return;
+    try {
+      const folder = await DocumentReader.createFolder(name);
+      setFolders(list => [...list, folder]);
+      recordLog(`ui folder created ${folder.id}`);
+    } catch (error) {
+      Alert.alert('Could not create folder', describeError(error));
+    }
+  };
+
+  const deleteFolderNow = (folder: Folder) => {
+    Alert.alert(
+      'Delete folder?',
+      `"${folder.name}" will be removed. Books inside it move back to the library.`,
+      [
+        {text: 'Cancel', style: 'cancel'},
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              try {
+                await DocumentReader.deleteFolder(folder.id);
+                if (currentFolderId === folder.id) setCurrentFolderId(null);
+                await refreshLibrary();
+              } catch (error) {
+                Alert.alert('Could not delete folder', describeError(error));
+              }
+            })();
+          },
+        },
+      ],
+    );
+  };
+
+  const moveBookTo = async (book: LibraryBook, folderId: string | null) => {
+    setMoveBook(null);
+    try {
+      const updated = await DocumentReader.moveDocument(book.id, folderId);
+      updateBookInState(updated);
+      recordLog(`ui move book ${book.id} -> ${folderId ?? 'root'}`);
+    } catch (error) {
+      Alert.alert('Could not move book', describeError(error));
     }
   };
 
@@ -588,13 +639,21 @@ function App() {
       const doc = await DocumentReader.pickDocument();
       const parsed = splitSentences(doc.text);
       if (!parsed.length) throw new Error('No readable sentences found in this document');
-      const book = await DocumentReader.saveLibraryDocument(
+      let book = await DocumentReader.saveLibraryDocument(
         doc.title,
         doc.kind,
         doc.uri,
         doc.text,
         parsed.length,
       );
+      // New imports land in the folder the user is currently viewing.
+      if (currentFolderId) {
+        try {
+          book = await DocumentReader.moveDocument(book.id, currentFolderId);
+        } catch (error) {
+          recordLog(`ui import move-to-folder failed ${describeError(error)}`);
+        }
+      }
       updateBookInState(book);
       await enterReader(book, doc.text);
       setStatus(`${doc.kind.toUpperCase()} added · ready to read`);
@@ -832,40 +891,79 @@ function App() {
       ? Math.max(0, Math.min(100, Math.round(((book.lastPosition + 1) / book.sentenceCount) * 100)))
       : 0;
 
-  const renderBookItem = ({item}: {item: LibraryBook}) => {
-    const cover = coverFor(item.title);
-    return (
-      <Pressable
-        style={({pressed}) => [styles.bookRow, pressed && styles.pressed]}
-        onPress={() => openLibraryBook(item)}>
-        <View style={[styles.bookCover, {backgroundColor: cover.top}]}>
-          <View style={[styles.bookCoverShade, {backgroundColor: cover.bottom}]} />
-          <Text style={styles.bookCoverLetter}>{cover.letter}</Text>
-          <Text style={styles.bookCoverKind}>{item.kind.toUpperCase()}</Text>
+  const renderBookItem = ({item}: {item: LibraryBook}) => (
+    <Pressable
+      style={({pressed}) => [styles.bookRow, pressed && styles.pressed]}
+      onPress={() => openLibraryBook(item)}>
+      <View style={styles.bookCover}>
+        <Text style={styles.bookCoverKind}>{item.kind.toUpperCase()}</Text>
+      </View>
+      <View style={styles.bookInfo}>
+        <Text style={styles.bookTitle} numberOfLines={2}>
+          {item.title}
+        </Text>
+        <Text style={styles.bookMeta} numberOfLines={1}>
+          {item.sentenceCount} sections · {bookProgress(item)}% read
+        </Text>
+        <View style={styles.bookProgressTrack}>
+          <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
         </View>
-        <View style={styles.bookInfo}>
-          <Text style={styles.bookTitle} numberOfLines={2}>
-            {item.title}
-          </Text>
-          <Text style={styles.bookMeta} numberOfLines={1}>
-            {item.sentenceCount} sections · {bookProgress(item)}% read
-          </Text>
-          <View style={styles.bookProgressTrack}>
-            <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
-          </View>
-          <Text style={styles.localPill} numberOfLines={1}>
-            Local system voice
-          </Text>
-        </View>
+        <Text style={styles.localPill} numberOfLines={1}>
+          Local system voice
+        </Text>
+      </View>
+      <View style={styles.bookActions}>
         <Pressable
-          style={({pressed}) => [styles.deleteButton, pressed && styles.pressed]}
+          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
+          onPress={event => {
+            event.stopPropagation();
+            setMoveBook(item);
+          }}
+          disabled={busy || playing}
+          hitSlop={8}>
+          <Text style={styles.rowIconText}>↪</Text>
+        </Pressable>
+        <Pressable
+          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
           onPress={event => {
             event.stopPropagation();
             void deleteBook(item);
           }}
           disabled={busy || playing}
-          hitSlop={10}>
-          <Text style={styles.deleteButtonText}>×</Text>
+          hitSlop={8}>
+          <Text style={styles.rowIconText}>×</Text>
+        </Pressable>
+      </View>
+    </Pressable>
+  );
+
+  const renderFolderItem = (folder: Folder) => {
+    const count = library.filter(b => b.folderId === folder.id).length;
+    return (
+      <Pressable
+        key={folder.id}
+        style={({pressed}) => [styles.folderRow, pressed && styles.pressed]}
+        onPress={() => setCurrentFolderId(folder.id)}>
+        <View style={styles.folderIcon}>
+          <Text style={styles.folderIconText}>🗀</Text>
+        </View>
+        <View style={styles.bookInfo}>
+          <Text style={styles.bookTitle} numberOfLines={1}>
+            {folder.name}
+          </Text>
+          <Text style={styles.bookMeta} numberOfLines={1}>
+            {count} {count === 1 ? 'item' : 'items'}
+          </Text>
+        </View>
+        <Pressable
+          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
+          onPress={event => {
+            event.stopPropagation();
+            deleteFolderNow(folder);
+          }}
+          disabled={busy || playing}
+          hitSlop={8}>
+          <Text style={styles.rowIconText}>×</Text>
         </Pressable>
       </Pressable>
     );
@@ -890,13 +988,30 @@ function App() {
   };
 
   if (view === 'library') {
+    const currentFolder = folders.find(f => f.id === currentFolderId) ?? null;
+    const visibleFolders = currentFolderId ? [] : folders;
+    const visibleBooks = library.filter(b => (b.folderId ?? null) === currentFolderId);
     return (
       <SafeAreaView style={styles.screen} edges={['top']}>
         <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
         <View style={styles.libraryHeader}>
-          <View>
-            <Text style={styles.title}>Audio Read</Text>
-            <Text style={styles.subtitle}>Library</Text>
+          <View style={styles.headerTitleRow}>
+            {currentFolder ? (
+              <Pressable
+                style={({pressed}) => [styles.backButton, pressed && styles.pressed]}
+                onPress={() => setCurrentFolderId(null)}
+                hitSlop={8}>
+                <Text style={styles.backButtonText}>‹</Text>
+              </Pressable>
+            ) : null}
+            <View style={styles.headerText}>
+              <Text style={styles.title} numberOfLines={1}>
+                {currentFolder ? currentFolder.name : 'Audio Read'}
+              </Text>
+              <Text style={styles.subtitle}>
+                {currentFolder ? 'Folder' : 'Library'}
+              </Text>
+            </View>
           </View>
           <Pressable style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]} onPress={() => setShowMenu(true)} hitSlop={10}>
             <Text style={styles.kebabText}>⋮</Text>
@@ -904,18 +1019,35 @@ function App() {
         </View>
 
         <FlatList
-          data={library}
+          data={visibleBooks}
           keyExtractor={item => item.id}
           renderItem={renderBookItem}
           contentContainerStyle={styles.libraryContent}
+          ListHeaderComponent={
+            visibleFolders.length ? (
+              <View style={styles.folderList}>{visibleFolders.map(renderFolderItem)}</View>
+            ) : null
+          }
           ListEmptyComponent={
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyTitle}>No books yet</Text>
-              <Text style={styles.emptyText}>Import a PDF, EPUB, or TXT file to add it to your library.</Text>
-              <Pressable style={({pressed}) => [styles.emptyButton, pressed && styles.pressed]} onPress={openDocument} disabled={busy}>
-                <Text style={styles.openButtonText}>Import document</Text>
-              </Pressable>
-            </View>
+            visibleFolders.length ? (
+              <View style={styles.folderHint}>
+                <Text style={styles.emptyText}>
+                  No loose books here. Open a folder, or import a document.
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>
+                  {currentFolder ? 'This folder is empty' : 'No books yet'}
+                </Text>
+                <Text style={styles.emptyText}>
+                  Import a PDF, EPUB, or TXT file{currentFolder ? ' to add it here.' : ' to add it to your library.'}
+                </Text>
+                <Pressable style={({pressed}) => [styles.emptyButton, pressed && styles.pressed]} onPress={openDocument} disabled={busy}>
+                  <Text style={styles.openButtonText}>Import document</Text>
+                </Pressable>
+              </View>
+            )
           }
         />
 
@@ -946,6 +1078,16 @@ function App() {
                 style={({pressed}) => [styles.menuItem, pressed && styles.pressed]}
                 onPress={() => {
                   setShowMenu(false);
+                  setNewFolderName('');
+                  setShowNewFolder(true);
+                }}>
+                <Text style={styles.menuItemText}>New folder</Text>
+              </Pressable>
+              <View style={styles.menuDivider} />
+              <Pressable
+                style={({pressed}) => [styles.menuItem, pressed && styles.pressed]}
+                onPress={() => {
+                  setShowMenu(false);
                   setShowVoices(true);
                 }}
                 disabled={voices.length === 0}>
@@ -962,6 +1104,83 @@ function App() {
                 }}>
                 <Text style={styles.menuItemText}>Logs</Text>
               </Pressable>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        <Modal
+          visible={showNewFolder}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setShowNewFolder(false)}>
+          <Pressable style={styles.menuBackdrop} onPress={() => setShowNewFolder(false)}>
+            <Pressable style={styles.dialog} onPress={() => {}}>
+              <Text style={styles.dialogTitle}>New folder</Text>
+              <TextInput
+                style={styles.dialogInput}
+                placeholder="Folder name"
+                placeholderTextColor={colors.muted}
+                value={newFolderName}
+                onChangeText={setNewFolderName}
+                autoFocus
+                onSubmitEditing={() => void createFolderNow()}
+              />
+              <View style={styles.dialogActions}>
+                <Pressable
+                  style={({pressed}) => [styles.dialogButton, pressed && styles.pressed]}
+                  onPress={() => setShowNewFolder(false)}>
+                  <Text style={styles.dialogButtonText}>Cancel</Text>
+                </Pressable>
+                <Pressable
+                  style={({pressed}) => [
+                    styles.dialogButton,
+                    styles.dialogButtonPrimary,
+                    pressed && styles.pressed,
+                  ]}
+                  onPress={() => void createFolderNow()}>
+                  <Text style={styles.dialogButtonPrimaryText}>Create</Text>
+                </Pressable>
+              </View>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        <Modal
+          visible={moveBook != null}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setMoveBook(null)}>
+          <Pressable style={styles.menuBackdrop} onPress={() => setMoveBook(null)}>
+            <Pressable style={styles.dialog} onPress={() => {}}>
+              <Text style={styles.dialogTitle} numberOfLines={1}>
+                {`Move “${moveBook?.title ?? ''}”`}
+              </Text>
+              <Pressable
+                style={({pressed}) => [styles.moveRow, pressed && styles.pressed]}
+                onPress={() => moveBook && void moveBookTo(moveBook, null)}>
+                <Text style={styles.moveRowIcon}>🏠</Text>
+                <Text style={styles.menuItemText}>Library (root)</Text>
+                {(moveBook?.folderId ?? null) === null ? (
+                  <Text style={styles.moveCheck}>✓</Text>
+                ) : null}
+              </Pressable>
+              {folders.map(folder => (
+                <Pressable
+                  key={folder.id}
+                  style={({pressed}) => [styles.moveRow, pressed && styles.pressed]}
+                  onPress={() => moveBook && void moveBookTo(moveBook, folder.id)}>
+                  <Text style={styles.moveRowIcon}>🗀</Text>
+                  <Text style={styles.menuItemText} numberOfLines={1}>
+                    {folder.name}
+                  </Text>
+                  {moveBook?.folderId === folder.id ? (
+                    <Text style={styles.moveCheck}>✓</Text>
+                  ) : null}
+                </Pressable>
+              ))}
+              {folders.length === 0 ? (
+                <Text style={styles.emptyText}>No folders yet. Create one first.</Text>
+              ) : null}
             </Pressable>
           </Pressable>
         </Modal>
@@ -1320,36 +1539,153 @@ function makeStyles(colors: typeof lightColors) {
       elevation: 3,
     },
     bookCover: {
-      width: 76,
+      width: 72,
       borderRadius: 10,
-      overflow: 'hidden',
+      backgroundColor: colors.surface2,
+      borderColor: colors.border,
+      borderWidth: StyleSheet.hairlineWidth,
       alignItems: 'center',
       justifyContent: 'center',
     },
-    bookCoverShade: {
-      position: 'absolute',
-      left: 0,
-      right: 0,
-      bottom: 0,
-      height: '52%',
-      opacity: 0.5,
-    },
-    bookCoverLetter: {
-      color: '#ffffff',
-      fontSize: 32,
-      fontWeight: '900',
-      includeFontPadding: false,
-    },
     bookCoverKind: {
-      position: 'absolute',
-      bottom: 7,
-      color: 'rgba(255,255,255,0.9)',
-      fontSize: 9,
-      fontWeight: '800',
-      letterSpacing: 1.5,
+      color: colors.accent,
+      fontSize: 12,
+      fontWeight: '900',
+      letterSpacing: 1,
     },
     pressed: {
       opacity: 0.62,
+    },
+    headerTitleRow: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+    },
+    folderList: {
+      gap: 10,
+      marginBottom: 10,
+    },
+    folderHint: {
+      paddingVertical: 18,
+      paddingHorizontal: 8,
+    },
+    folderRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+      borderRadius: 16,
+      borderColor: colors.border,
+      borderWidth: StyleSheet.hairlineWidth,
+      backgroundColor: colors.surface,
+      padding: 12,
+      shadowColor: '#000',
+      shadowOpacity: colors.shadow,
+      shadowRadius: 10,
+      shadowOffset: {width: 0, height: 4},
+      elevation: 3,
+    },
+    folderIcon: {
+      width: 48,
+      height: 48,
+      borderRadius: 12,
+      backgroundColor: colors.surface2,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    folderIconText: {
+      fontSize: 24,
+    },
+    bookActions: {
+      justifyContent: 'center',
+      gap: 8,
+    },
+    rowIconButton: {
+      width: 34,
+      height: 34,
+      borderRadius: 17,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.surface2,
+    },
+    rowIconText: {
+      color: colors.muted,
+      fontSize: 19,
+      lineHeight: 22,
+      fontWeight: '700',
+    },
+    dialog: {
+      position: 'absolute',
+      left: 24,
+      right: 24,
+      top: '32%',
+      borderRadius: 18,
+      backgroundColor: colors.surface,
+      borderColor: colors.border,
+      borderWidth: StyleSheet.hairlineWidth,
+      padding: 18,
+      gap: 14,
+      shadowColor: '#000',
+      shadowOpacity: 0.35,
+      shadowRadius: 18,
+      shadowOffset: {width: 0, height: 8},
+      elevation: 14,
+    },
+    dialogTitle: {
+      color: colors.text,
+      fontSize: 17,
+      fontWeight: '800',
+    },
+    dialogInput: {
+      borderRadius: 10,
+      borderColor: colors.border,
+      borderWidth: 1,
+      backgroundColor: colors.bg,
+      color: colors.text,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      fontSize: 16,
+    },
+    dialogActions: {
+      flexDirection: 'row',
+      justifyContent: 'flex-end',
+      gap: 10,
+    },
+    dialogButton: {
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderRadius: 10,
+    },
+    dialogButtonText: {
+      color: colors.muted,
+      fontSize: 15,
+      fontWeight: '700',
+    },
+    dialogButtonPrimary: {
+      backgroundColor: colors.accent,
+    },
+    dialogButtonPrimaryText: {
+      color: colors.accentText,
+      fontSize: 15,
+      fontWeight: '800',
+    },
+    moveRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+      paddingVertical: 12,
+      paddingHorizontal: 6,
+    },
+    moveRowIcon: {
+      fontSize: 18,
+      width: 24,
+      textAlign: 'center',
+    },
+    moveCheck: {
+      marginLeft: 'auto',
+      color: colors.accent,
+      fontSize: 16,
+      fontWeight: '900',
     },
     bookInfo: {
       flex: 1,
