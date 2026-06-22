@@ -437,6 +437,9 @@ class DocumentModule(
     var page = -1
     val pending = ArrayList<GlyphStripper.Glyph>()
     var lastSpace = true
+    var lineY = 0f
+    var lineH = 0f
+    var hasLine = false
 
     fun flush() {
       val t = sb.toString().trim()
@@ -446,7 +449,7 @@ class DocumentModule(
           out.add(PdfSentence(t, if (page < 0) 0 else page, rects))
         }
       }
-      sb.setLength(0); page = -1; pending.clear(); lastSpace = true
+      sb.setLength(0); page = -1; pending.clear(); lastSpace = true; hasLine = false
     }
 
     for (g in glyphs) {
@@ -454,7 +457,25 @@ class DocumentModule(
         if (!lastSpace) { sb.append(' '); lastSpace = true }
         continue
       }
+      // A sentence ends at a layout break, not just a '.': a vertical gap larger than a
+      // normal line (paragraph spacing / heading), a jump upward or a page change (a new
+      // column / region). Without this, multi-column mastheads + titles + the first body
+      // line glue into one giant "sentence" because there is no terminator between them.
+      if (hasLine && page >= 0) {
+        val h = maxOf(if (g.h > 0f) g.h else lineH, if (lineH > 0f) lineH else g.h)
+        val tol = if (h > 0f) h else 0.012f
+        val advance = g.y - lineY
+        val blockBreak = g.page != page || advance > 1.5f * tol || advance < -0.5f * tol
+        if (blockBreak && sb.toString().any { it.isLetterOrDigit() }) {
+          flush()
+        }
+      }
       if (page < 0) page = g.page
+      if (!hasLine) {
+        lineY = g.y; lineH = if (g.h > 0f) g.h else lineH; hasLine = true
+      } else if (g.page == page && kotlin.math.abs(g.y - lineY) > (if (g.h > 0f) g.h else 0.012f) * 0.5f) {
+        lineY = g.y; lineH = if (g.h > 0f) g.h else lineH
+      }
       sb.append(g.c); lastSpace = false
       // Only the glyphs on the sentence's starting page contribute to its boxes.
       if (g.page == page) pending.add(g)
