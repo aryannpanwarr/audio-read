@@ -61,10 +61,15 @@ const buildInjectedScript = (dark: boolean) => `
       + 'img,svg,image{display:block !important;margin:1em auto !important;max-width:100% !important;height:auto !important;}'
       + 'a{text-decoration:none !important;}'
       + '.ar-chapter{display:block !important;margin:0 0 2.5em !important;}'
-      + '.ar-w{transition:background-color .1s ease;border-radius:3px;}'
-      + '.ar-uactive{background-color:' + PARA_BG + ' !important;border-radius:4px;'
-      + 'box-shadow:0 0 0 5px ' + PARA_BG + ' !important;}'
-      + '.ar-wactive{background-color:' + WORD_BG + ' !important;}';
+      + '.ar-w,.ar-s{transition:background-color .1s ease;}'
+      // Active unit: a single continuous band. Words + the spaces between them
+      // share a flat (no radius, no shadow) background so adjacent tokens butt
+      // together into one block that wraps cleanly across lines.
+      + '.ar-uactive{background-color:' + PARA_BG + ' !important;border-radius:0 !important;'
+      + 'box-shadow:none !important;padding:0.06em 0 !important;'
+      + '-webkit-box-decoration-break:clone;box-decoration-break:clone;}'
+      // Word tracker: a brighter rounded pill riding on top of the band.
+      + '.ar-wactive{background-color:' + WORD_BG + ' !important;border-radius:4px !important;}';
     document.head.appendChild(style);
 
     var BLOCK = {P:1,LI:1,H1:1,H2:1,H3:1,H4:1,H5:1,H6:1,BLOCKQUOTE:1,DIV:1,SECTION:1,
@@ -91,10 +96,18 @@ const buildInjectedScript = (dark: boolean) => `
       if (text) { units[curIdx] = text; curIdx++; }
       curText = '';
     }
+    // The inter-word space is wrapped in its own span tagged with the unit
+    // index so it can be highlighted too — that's what turns the active-unit
+    // highlight into one continuous band instead of separate per-word pills.
     function appendSpace(frag){
       if (curText.length && curText.charAt(curText.length - 1) !== ' ') {
+        var sp = document.createElement('span');
+        sp.className = 'ar-s';
+        sp.setAttribute('data-p', curIdx);
+        sp.setAttribute('data-c', curText.length);
+        sp.textContent = ' ';
+        frag.appendChild(sp);
         curText += ' ';
-        frag.appendChild(document.createTextNode(' '));
       }
     }
     // Common abbreviations whose trailing '.' must NOT end a sentence unit,
@@ -146,7 +159,7 @@ const buildInjectedScript = (dark: boolean) => `
       var t = e.target;
       while (t && t !== document.body) {
         if (t.nodeName === 'A') { e.preventDefault(); }
-        if (t.classList && t.classList.contains('ar-w')) {
+        if (t.classList && (t.classList.contains('ar-w') || t.classList.contains('ar-s'))) {
           post({type:'tapWord', p: parseInt(t.getAttribute('data-p'), 10), c: parseInt(t.getAttribute('data-c'), 10)});
           return;
         }
@@ -167,7 +180,8 @@ const buildInjectedScript = (dark: boolean) => `
     window.arHighlight = function(p){
       document.querySelectorAll('.ar-uactive').forEach(function(e){ e.classList.remove('ar-uactive'); });
       document.querySelectorAll('.ar-wactive').forEach(function(e){ e.classList.remove('ar-wactive'); });
-      var spans = document.querySelectorAll('.ar-w[data-p="' + p + '"]');
+      // Words AND the spaces between them, so the band is continuous.
+      var spans = document.querySelectorAll('.ar-w[data-p="' + p + '"],.ar-s[data-p="' + p + '"]');
       spans.forEach(function(e){ e.classList.add('ar-uactive'); });
       if (spans.length) spans[0].scrollIntoView({behavior:'smooth', block:'center'});
     };
