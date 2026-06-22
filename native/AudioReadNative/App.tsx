@@ -242,6 +242,27 @@ function formatTotalLength(seconds: number) {
   return 'under 1 min';
 }
 
+// Curated [top, bottom] tints for the auto-generated book covers. The cover color is
+// picked deterministically from the title so a book always looks the same.
+const COVER_PALETTE: [string, string][] = [
+  ['#0f766e', '#0b5a53'],
+  ['#b45309', '#8a3f08'],
+  ['#7c3aed', '#5b21b6'],
+  ['#be123c', '#911030'],
+  ['#1d4ed8', '#1a3fab'],
+  ['#047857', '#045f45'],
+  ['#c2410c', '#97330a'],
+  ['#0e7490', '#0c5d73'],
+];
+
+function coverFor(title: string) {
+  let h = 0;
+  for (let i = 0; i < title.length; i++) h = (h * 31 + title.charCodeAt(i)) >>> 0;
+  const [top, bottom] = COVER_PALETTE[h % COVER_PALETTE.length];
+  const letter = (title.trim().match(/[A-Za-z0-9]/)?.[0] ?? '?').toUpperCase();
+  return {top, bottom, letter};
+}
+
 function App() {
   const dark = useColorScheme() === 'dark';
   const colors = dark ? darkColors : lightColors;
@@ -811,37 +832,44 @@ function App() {
       ? Math.max(0, Math.min(100, Math.round(((book.lastPosition + 1) / book.sentenceCount) * 100)))
       : 0;
 
-  const renderBookItem = ({item}: {item: LibraryBook}) => (
-    <Pressable style={styles.bookRow} onPress={() => openLibraryBook(item)}>
-      <View style={styles.bookCover}>
-        <Text style={styles.bookCoverText}>{item.kind.toUpperCase()}</Text>
-      </View>
-      <View style={styles.bookInfo}>
-        <Text style={styles.bookTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
-        <Text style={styles.bookMeta} numberOfLines={1}>
-          {item.sentenceCount} sections · {bookProgress(item)}% read
-        </Text>
-        <View style={styles.bookProgressTrack}>
-          <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
-        </View>
-        <Text style={styles.localPill} numberOfLines={1}>
-          Local system voice
-        </Text>
-      </View>
+  const renderBookItem = ({item}: {item: LibraryBook}) => {
+    const cover = coverFor(item.title);
+    return (
       <Pressable
-        style={styles.deleteButton}
-        onPress={event => {
-          event.stopPropagation();
-          void deleteBook(item);
-        }}
-        disabled={busy || playing}
-        hitSlop={10}>
-        <Text style={styles.deleteButtonText}>x</Text>
+        style={({pressed}) => [styles.bookRow, pressed && styles.pressed]}
+        onPress={() => openLibraryBook(item)}>
+        <View style={[styles.bookCover, {backgroundColor: cover.top}]}>
+          <View style={[styles.bookCoverShade, {backgroundColor: cover.bottom}]} />
+          <Text style={styles.bookCoverLetter}>{cover.letter}</Text>
+          <Text style={styles.bookCoverKind}>{item.kind.toUpperCase()}</Text>
+        </View>
+        <View style={styles.bookInfo}>
+          <Text style={styles.bookTitle} numberOfLines={2}>
+            {item.title}
+          </Text>
+          <Text style={styles.bookMeta} numberOfLines={1}>
+            {item.sentenceCount} sections · {bookProgress(item)}% read
+          </Text>
+          <View style={styles.bookProgressTrack}>
+            <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
+          </View>
+          <Text style={styles.localPill} numberOfLines={1}>
+            Local system voice
+          </Text>
+        </View>
+        <Pressable
+          style={({pressed}) => [styles.deleteButton, pressed && styles.pressed]}
+          onPress={event => {
+            event.stopPropagation();
+            void deleteBook(item);
+          }}
+          disabled={busy || playing}
+          hitSlop={10}>
+          <Text style={styles.deleteButtonText}>×</Text>
+        </Pressable>
       </Pressable>
-    </Pressable>
-  );
+    );
+  };
 
   const handleScrollToIndexFailed = (info: {
     index: number;
@@ -870,7 +898,7 @@ function App() {
             <Text style={styles.title}>Audio Read</Text>
             <Text style={styles.subtitle}>Library</Text>
           </View>
-          <Pressable style={styles.kebabButton} onPress={() => setShowMenu(true)} hitSlop={10}>
+          <Pressable style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]} onPress={() => setShowMenu(true)} hitSlop={10}>
             <Text style={styles.kebabText}>⋮</Text>
           </Pressable>
         </View>
@@ -884,7 +912,7 @@ function App() {
             <View style={styles.emptyState}>
               <Text style={styles.emptyTitle}>No books yet</Text>
               <Text style={styles.emptyText}>Import a PDF, EPUB, or TXT file to add it to your library.</Text>
-              <Pressable style={styles.emptyButton} onPress={openDocument} disabled={busy}>
+              <Pressable style={({pressed}) => [styles.emptyButton, pressed && styles.pressed]} onPress={openDocument} disabled={busy}>
                 <Text style={styles.openButtonText}>Import document</Text>
               </Pressable>
             </View>
@@ -905,7 +933,7 @@ function App() {
           <Pressable style={styles.menuBackdrop} onPress={() => setShowMenu(false)}>
             <Pressable style={[styles.menuPanel, {top: insets.top + 56}]} onPress={() => {}}>
               <Pressable
-                style={styles.menuItem}
+                style={({pressed}) => [styles.menuItem, pressed && styles.pressed]}
                 onPress={() => {
                   setShowMenu(false);
                   void openDocument();
@@ -915,7 +943,7 @@ function App() {
               </Pressable>
               <View style={styles.menuDivider} />
               <Pressable
-                style={styles.menuItem}
+                style={({pressed}) => [styles.menuItem, pressed && styles.pressed]}
                 onPress={() => {
                   setShowMenu(false);
                   setShowVoices(true);
@@ -927,7 +955,7 @@ function App() {
               </Pressable>
               <View style={styles.menuDivider} />
               <Pressable
-                style={styles.menuItem}
+                style={({pressed}) => [styles.menuItem, pressed && styles.pressed]}
                 onPress={() => {
                   setShowMenu(false);
                   void exportLogs();
@@ -958,7 +986,7 @@ function App() {
     <SafeAreaView style={styles.screen} edges={['top']}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
       <View style={styles.header}>
-        <Pressable style={styles.backButton} onPress={() => setView('library')} disabled={busy && !playing}>
+        <Pressable style={({pressed}) => [styles.backButton, pressed && styles.pressed]} onPress={() => setView('library')} disabled={busy && !playing}>
           <Text style={styles.backButtonText}>‹</Text>
         </Pressable>
         <View style={styles.headerText}>
@@ -969,7 +997,7 @@ function App() {
             {documentKind.toUpperCase()} · {formatTotalLength(totalSeconds)}
           </Text>
         </View>
-        <Pressable style={styles.kebabButton} onPress={() => setShowMenu(true)} hitSlop={10}>
+        <Pressable style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]} onPress={() => setShowMenu(true)} hitSlop={10}>
           <Text style={styles.kebabText}>⋮</Text>
         </Pressable>
       </View>
@@ -1052,6 +1080,32 @@ function App() {
       </View>
 
       <View style={[styles.bottomBar, {paddingBottom: 14 + insets.bottom}]}>
+        <View style={styles.playerTrack}>
+          <View
+            style={[
+              styles.playerFill,
+              {
+                width: `${
+                  totalSeconds > 0
+                    ? Math.min(100, (elapsedSeconds / totalSeconds) * 100)
+                    : 0
+                }%`,
+              },
+            ]}
+          />
+          <View
+            style={[
+              styles.playerThumb,
+              {
+                left: `${
+                  totalSeconds > 0
+                    ? Math.min(100, (elapsedSeconds / totalSeconds) * 100)
+                    : 0
+                }%`,
+              },
+            ]}
+          />
+        </View>
         <View style={styles.timeRow}>
           <Text style={styles.timeText}>{formatClock(elapsedSeconds)}</Text>
           <Text style={[styles.status, styles.statusFlex]} numberOfLines={1}>
@@ -1062,19 +1116,23 @@ function App() {
 
         <View style={styles.controls}>
           <Pressable
-            style={styles.iconButton}
+            style={({pressed}) => [styles.iconButton, pressed && styles.pressed]}
             onPress={() => skipTo(current - 1)}
             disabled={(busy && !playing) || current === 0}>
             <Text style={styles.iconButtonText}>‹</Text>
           </Pressable>
           <Pressable
-            style={[styles.playButton, busy && !playing && styles.disabled]}
+            style={({pressed}) => [
+              styles.playButton,
+              pressed && styles.pressed,
+              busy && !playing && styles.disabled,
+            ]}
             onPress={playPause}
             disabled={busy && !playing}>
-            <Text style={styles.playButtonText}>{playing ? 'Pause' : 'Play'}</Text>
+            <Text style={styles.playButtonIcon}>{playing ? '❚❚' : '▶'}</Text>
           </Pressable>
           <Pressable
-            style={styles.iconButton}
+            style={({pressed}) => [styles.iconButton, pressed && styles.pressed]}
             onPress={() => skipTo(current + 1)}
             disabled={(busy && !playing) || current >= sentences.length - 1}>
             <Text style={styles.iconButtonText}>›</Text>
@@ -1147,29 +1205,31 @@ function App() {
 }
 
 const lightColors = {
-  bg: '#f6f7f4',
+  bg: '#f4f2ec',
   surface: '#ffffff',
-  surface2: '#e8ece7',
-  text: '#1d2423',
-  muted: '#69726f',
-  border: '#d8ded8',
+  surface2: '#e9ece6',
+  text: '#1c2322',
+  muted: '#6b746f',
+  border: '#dfe3dc',
   accent: '#0f766e',
   accent2: '#b45309',
   accentText: '#ffffff',
   highlight: '#fef3c7',
+  shadow: 0.1,
 };
 
 const darkColors = {
-  bg: '#101312',
+  bg: '#0e1110',
   surface: '#181d1b',
   surface2: '#27302d',
   text: '#f4f6f2',
   muted: '#a7b0ac',
-  border: '#303936',
+  border: '#2c3431',
   accent: '#2dd4bf',
   accent2: '#f59e0b',
   accentText: '#06211e',
   highlight: '#4a3d18',
+  shadow: 0.45,
 };
 
 function makeStyles(colors: typeof lightColors) {
@@ -1248,25 +1308,48 @@ function makeStyles(colors: typeof lightColors) {
       flexDirection: 'row',
       gap: 12,
       minHeight: 116,
-      borderRadius: 8,
+      borderRadius: 16,
       borderColor: colors.border,
-      borderWidth: 1,
+      borderWidth: StyleSheet.hairlineWidth,
       backgroundColor: colors.surface,
       padding: 12,
+      shadowColor: '#000',
+      shadowOpacity: colors.shadow,
+      shadowRadius: 10,
+      shadowOffset: {width: 0, height: 4},
+      elevation: 3,
     },
     bookCover: {
-      width: 72,
-      borderRadius: 6,
-      backgroundColor: colors.surface2,
-      borderColor: colors.border,
-      borderWidth: 1,
+      width: 76,
+      borderRadius: 10,
+      overflow: 'hidden',
       alignItems: 'center',
       justifyContent: 'center',
     },
-    bookCoverText: {
-      color: colors.accent,
-      fontSize: 12,
+    bookCoverShade: {
+      position: 'absolute',
+      left: 0,
+      right: 0,
+      bottom: 0,
+      height: '52%',
+      opacity: 0.5,
+    },
+    bookCoverLetter: {
+      color: '#ffffff',
+      fontSize: 32,
       fontWeight: '900',
+      includeFontPadding: false,
+    },
+    bookCoverKind: {
+      position: 'absolute',
+      bottom: 7,
+      color: 'rgba(255,255,255,0.9)',
+      fontSize: 9,
+      fontWeight: '800',
+      letterSpacing: 1.5,
+    },
+    pressed: {
+      opacity: 0.62,
     },
     bookInfo: {
       flex: 1,
@@ -1298,14 +1381,15 @@ function makeStyles(colors: typeof lightColors) {
     localPill: {
       alignSelf: 'flex-start',
       maxWidth: '100%',
+      overflow: 'hidden',
       color: colors.accent,
-      borderColor: colors.accent,
-      borderWidth: 1,
-      borderRadius: 6,
-      paddingHorizontal: 8,
+      backgroundColor: colors.surface2,
+      borderRadius: 999,
+      paddingHorizontal: 10,
       paddingVertical: 3,
       fontSize: 11,
       fontWeight: '800',
+      letterSpacing: 0.2,
     },
     deleteButton: {
       width: 34,
@@ -1357,9 +1441,16 @@ function makeStyles(colors: typeof lightColors) {
       padding: 14,
       paddingBottom: 18,
       backgroundColor: colors.surface,
+      borderTopLeftRadius: 22,
+      borderTopRightRadius: 22,
       borderTopColor: colors.border,
-      borderTopWidth: 1,
+      borderTopWidth: StyleSheet.hairlineWidth,
       gap: 10,
+      shadowColor: '#000',
+      shadowOpacity: colors.shadow,
+      shadowRadius: 16,
+      shadowOffset: {width: 0, height: -4},
+      elevation: 12,
     },
     readerBody: {
       flex: 1,
@@ -1405,12 +1496,20 @@ function makeStyles(colors: typeof lightColors) {
       left: 0,
       right: 0,
       bottom: 0,
-      padding: 14,
+      paddingHorizontal: 18,
+      paddingTop: 16,
       paddingBottom: 18,
       backgroundColor: colors.surface,
+      borderTopLeftRadius: 22,
+      borderTopRightRadius: 22,
       borderTopColor: colors.border,
-      borderTopWidth: 1,
+      borderTopWidth: StyleSheet.hairlineWidth,
       gap: 10,
+      shadowColor: '#000',
+      shadowOpacity: colors.shadow,
+      shadowRadius: 16,
+      shadowOffset: {width: 0, height: -4},
+      elevation: 12,
     },
     status: {
       color: colors.muted,
@@ -1457,10 +1556,10 @@ function makeStyles(colors: typeof lightColors) {
       position: 'absolute',
       right: 12,
       minWidth: 170,
-      borderRadius: 12,
+      borderRadius: 16,
       backgroundColor: colors.surface,
       borderColor: colors.border,
-      borderWidth: 1,
+      borderWidth: StyleSheet.hairlineWidth,
       paddingVertical: 6,
       shadowColor: '#000',
       shadowOpacity: 0.3,
@@ -1492,12 +1591,12 @@ function makeStyles(colors: typeof lightColors) {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 12,
+      gap: 22,
     },
     iconButton: {
-      width: 48,
-      height: 48,
-      borderRadius: 24,
+      width: 52,
+      height: 52,
+      borderRadius: 26,
       backgroundColor: colors.surface2,
       alignItems: 'center',
       justifyContent: 'center',
@@ -1508,18 +1607,47 @@ function makeStyles(colors: typeof lightColors) {
       lineHeight: 36,
     },
     playButton: {
-      minWidth: 140,
-      minHeight: 50,
-      borderRadius: 25,
+      width: 66,
+      height: 66,
+      borderRadius: 33,
       backgroundColor: colors.accent,
       alignItems: 'center',
       justifyContent: 'center',
-      paddingHorizontal: 20,
+      shadowColor: colors.accent,
+      shadowOpacity: 0.45,
+      shadowRadius: 12,
+      shadowOffset: {width: 0, height: 5},
+      elevation: 6,
     },
-    playButtonText: {
+    playButtonIcon: {
       color: colors.accentText,
-      fontWeight: '800',
-      fontSize: 16,
+      fontWeight: '900',
+      fontSize: 22,
+      includeFontPadding: false,
+    },
+    playerTrack: {
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: colors.surface2,
+      marginBottom: 12,
+    },
+    playerFill: {
+      height: 4,
+      borderRadius: 2,
+      backgroundColor: colors.accent,
+    },
+    playerThumb: {
+      position: 'absolute',
+      top: -4,
+      marginLeft: -6,
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+      backgroundColor: colors.accent,
+      shadowColor: colors.accent,
+      shadowOpacity: 0.5,
+      shadowRadius: 4,
+      elevation: 3,
     },
     optionsRow: {
       flexDirection: 'row',
@@ -1538,6 +1666,7 @@ function makeStyles(colors: typeof lightColors) {
       color: colors.muted,
       fontSize: 10,
       fontWeight: '800',
+      letterSpacing: 1,
       textTransform: 'uppercase',
       textAlign: 'center',
       marginBottom: 4,
