@@ -230,18 +230,52 @@ function isWord(part: string) {
   return /\S/.test(part);
 }
 
-// Honorifics/abbreviations whose trailing '.' makes the device TTS engine
-// insert a full sentence-boundary pause ("Ms. Hiratsuka" -> long gap), even
-// though we keep them in one reading unit. We blank that period (swap it for a
-// space) only in the string handed to TTS; length is preserved so onRangeStart
-// word offsets still line up with the on-screen text and highlight.
-const ABBREV_RE =
-  /\b(Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|Rev|Hon|Gen|Col|Sgt|Capt|Lt|Cpl|Maj|Messrs|Mt|vs|etc)\.(?=["')\]]*\s)/gi;
-function softenAbbreviations(text: string): string {
-  return text
-    .replace(ABBREV_RE, match => match.slice(0, -1) + ' ')
-    // Initials inside a unit ("J. R. R. Tolkien") pause the engine too.
-    .replace(/\b([A-Za-z])\.(?=["')\]]*\s)/g, '$1 ');
+// Abbreviations whose trailing '.' makes the device TTS engine insert a full
+// sentence-boundary pause ("Ms. Hiratsuka" -> long gap) even when they sit
+// inside one reading unit. For the ultra-common honorifics the engine's lexicon
+// pronounces the bare token correctly, so we just drop the period; the rest we
+// spell out so the word is still read in full once the period is gone.
+const DROP_PERIOD = new Set(['mr', 'mrs', 'ms', 'mx', 'dr', 'st']);
+const EXPAND: Record<string, string> = {
+  prof: 'Professor', rev: 'Reverend', gen: 'General', col: 'Colonel',
+  sgt: 'Sergeant', capt: 'Captain', lt: 'Lieutenant', maj: 'Major',
+  hon: 'Honorable', sr: 'Senior', jr: 'Junior', mt: 'Mount',
+  messrs: 'Messieurs', vs: 'versus', etc: 'etcetera',
+};
+
+// Rewrites the string handed to TTS (drop/expand known abbreviations) while
+// returning an index map: map[i] is the position in `input` that normalized
+// char i came from, so onRangeStart offsets translate back to the on-screen
+// text and the word highlight stays aligned even when lengths change. Only
+// known abbreviations are touched — never arbitrary periods — so real
+// sentence-ending periods inside a unit (PDF paragraphs) are left intact.
+function normalizeForSpeech(input: string): {text: string; map: number[]} {
+  const re = /\b([A-Za-z]+)\.(?=["')\]]*\s)/g;
+  let out = '';
+  const map: number[] = [];
+  let last = 0;
+  const pushVerbatim = (from: number, to: number) => {
+    for (let k = from; k < to; k++) {
+      out += input[k];
+      map.push(k);
+    }
+  };
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input))) {
+    const word = m[1];
+    const key = word.toLowerCase();
+    const replacement = DROP_PERIOD.has(key) ? word : EXPAND[key] ?? null;
+    if (replacement == null) continue; // unknown abbreviation -> leave untouched
+    pushVerbatim(last, m.index);
+    for (let k = 0; k < replacement.length; k++) {
+      out += replacement[k];
+      map.push(m.index); // map the whole replacement back to the original word
+    }
+    last = m.index + word.length + 1; // skip original word + its '.'
+  }
+  pushVerbatim(last, input.length);
+  map.push(input.length); // sentinel so end-of-string offsets still resolve
+  return {text: out, map};
 }
 
 // Music-player style clock: H:MM:SS once past an hour, otherwise M:SS.
@@ -319,6 +353,10 @@ function App() {
   const sentencesRef = useRef(sentences);
   const currentRef = useRef(current);
   const activeWordBaseRef = useRef(0);
+  // Index map for the utterance currently being spoken: normalized (spoken)
+  // char offset -> offset into the un-normalized sliced sentence text. Lets the
+  // word highlight follow onRangeStart even when normalization changes lengths.
+  const speechMapRef = useRef<number[] | null>(null);
   const backgroundPermissionPromptedRef = useRef(false);
   const sentencesResolveRef = useRef<((value: Sentence[]) => void) | null>(null);
 
@@ -338,6 +376,7 @@ function App() {
     setActiveWordStart(-1);
     setActiveWordBase(0);
     activeWordBaseRef.current = 0;
+    speechMapRef.current = null;
   }
 
   function updateActiveWordBase(offset: number) {
@@ -492,10 +531,14 @@ function App() {
       const end = (range as {end?: number})?.end;
       if (typeof start === 'number') {
         rangeEventCount += 1;
+        // Translate the offset (into the normalized spoken text) back to the
+        // on-screen text so the highlight lands on the right word.
+        const map = speechMapRef.current;
+        const mapped = map ? map[Math.min(start, map.length - 1)] : start;
         if (rangeEventCount <= 6) {
-          recordLog(`ui range event #${rangeEventCount} start=${start} end=${end}`);
+          recordLog(`ui range event #${rangeEventCount} start=${start}->${mapped} end=${end}`);
         }
-        setActiveWordStart(start);
+        setActiveWordStart(mapped);
       }
     });
     return () => {
@@ -796,7 +839,10 @@ function App() {
         const safeStart = Math.max(0, Math.min(sentence.text.length, requestedStart));
         const leadingWhitespace = sentence.text.slice(safeStart).match(/^\s*/)?.[0].length ?? 0;
         updateActiveWordBase(safeStart + leadingWhitespace);
-        const speakText = softenAbbreviations(sentence.text.slice(safeStart).trimStart());
+        const {text: speakText, map: speechMap} = normalizeForSpeech(
+          sentence.text.slice(safeStart).trimStart(),
+        );
+        speechMapRef.current = speechMap;
         if (speakText.length < 2) {
           index += 1;
           continue;
