@@ -425,31 +425,39 @@ class DocumentModule(
   }
 
   /**
-   * Walks the captured glyph stream, rebuilds sentences (terminator split, short
-   * fragments merged to >= 45 chars to mirror the JS splitter), and emits ONE tight
-   * rectangle per visual line of the sentence on its starting page. Per-line rects
-   * (rather than one union box) keep wrapped/multi-line sentences hugging the text
-   * instead of covering whole blocks of empty space.
+   * Walks the captured glyph stream and groups it into PARAGRAPHS (read + highlighted
+   * as one unit, "para by para"), NOT sentences — splitting at every '.' left choppy
+   * highlights with gaps. A paragraph ends only at a real layout break: a vertical gap
+   * noticeably larger than the paragraph's own line spacing, a jump up/left (new
+   * column), or a page change. The line spacing is learned adaptively so normal wrapped
+   * lines stay in the same paragraph. Each paragraph carries per-line, gap-filled rects
+   * so the highlight is one continuous block over its text. Very long paragraphs are
+   * chunked at sentence ends (sharing the paragraph's boxes) so no single TTS utterance
+   * gets unwieldy.
    */
   private fun buildPdfSentences(glyphs: List<GlyphStripper.Glyph>): List<PdfSentence> {
     val out = ArrayList<PdfSentence>()
     val sb = StringBuilder()
-    var page = -1
     val pending = ArrayList<GlyphStripper.Glyph>()
+    var page = -1
     var lastSpace = true
     var lineY = 0f
     var lineH = 0f
+    var lineAdvance = 0f
     var hasLine = false
 
-    fun flush() {
-      val t = sb.toString().trim()
-      if (t.length >= 2 && t.any { it.isLetterOrDigit() } && !isPageNumber(t)) {
+    fun flushPara() {
+      val text = sb.toString().trim()
+      if (text.length >= 2 && text.any { it.isLetterOrDigit() } && !isPageNumber(text)) {
         val rects = groupLines(pending)
         if (rects.isNotEmpty()) {
-          out.add(PdfSentence(t, if (page < 0) 0 else page, rects))
+          for (chunk in chunkParagraph(text)) {
+            out.add(PdfSentence(chunk, if (page < 0) 0 else page, rects))
+          }
         }
       }
-      sb.setLength(0); page = -1; pending.clear(); lastSpace = true; hasLine = false
+      sb.setLength(0); pending.clear(); page = -1
+      lastSpace = true; hasLine = false; lineAdvance = 0f
     }
 
     for (g in glyphs) {
@@ -457,17 +465,21 @@ class DocumentModule(
         if (!lastSpace) { sb.append(' '); lastSpace = true }
         continue
       }
-      // A sentence ends at a layout break, not just a '.': a vertical gap larger than a
-      // normal line (paragraph spacing / heading), a jump upward or a page change (a new
-      // column / region). Without this, multi-column mastheads + titles + the first body
-      // line glue into one giant "sentence" because there is no terminator between them.
       if (hasLine && page >= 0) {
-        val h = maxOf(if (g.h > 0f) g.h else lineH, if (lineH > 0f) lineH else g.h)
-        val tol = if (h > 0f) h else 0.012f
+        val tol = if (g.h > 0f) g.h else if (lineH > 0f) lineH else 0.012f
         val advance = g.y - lineY
-        val blockBreak = g.page != page || advance > 1.5f * tol || advance < -0.5f * tol
-        if (blockBreak && sb.toString().any { it.isLetterOrDigit() }) {
-          flush()
+        if (kotlin.math.abs(advance) > tol * 0.5f) {
+          // Moved to a new visual line — is it a new paragraph or just the next line?
+          val paragraphBreak = g.page != page ||
+            advance < -tol * 0.5f || // jumped up -> new column / region
+            (lineAdvance > 0f && advance > lineAdvance * 1.6f) || // gap >> normal leading
+            (lineAdvance <= 0f && advance > tol * 2.2f) // first gap, clearly large
+          if (paragraphBreak && sb.toString().any { it.isLetterOrDigit() }) {
+            flushPara()
+          } else if (advance > 0f) {
+            // Normal next line: learn this paragraph's typical line spacing.
+            lineAdvance = if (lineAdvance > 0f) lineAdvance * 0.5f + advance * 0.5f else advance
+          }
         }
       }
       if (page < 0) page = g.page
@@ -477,17 +489,39 @@ class DocumentModule(
         lineY = g.y; lineH = if (g.h > 0f) g.h else lineH
       }
       sb.append(g.c); lastSpace = false
-      // Only the glyphs on the sentence's starting page contribute to its boxes.
       if (g.page == page) pending.add(g)
-      if (g.c == '.' || g.c == '!' || g.c == '?') {
-        if (sb.toString().trim().length >= 45) flush()
-      }
     }
-    flush()
+    flushPara()
     return if (out.size > 8000) out.subList(0, 8000) else out
   }
 
-  /** Groups a sentence's glyphs into per-line tight bounding boxes (normalized 0..1). */
+  /** Splits an over-long paragraph at sentence ends so one TTS utterance stays sane. */
+  private fun chunkParagraph(text: String): List<String> {
+    if (text.length <= 1400) return listOf(text)
+    val out = ArrayList<String>()
+    val cur = StringBuilder()
+    for (c in text) {
+      cur.append(c)
+      if ((c == '.' || c == '!' || c == '?') && cur.length >= 700) {
+        out.add(cur.toString().trim()); cur.setLength(0)
+      }
+    }
+    val tail = cur.toString().trim()
+    if (tail.isNotEmpty()) {
+      if (out.isNotEmpty() && tail.length < 200) {
+        out[out.lastIndex] = (out.last() + " " + tail).trim()
+      } else {
+        out.add(tail)
+      }
+    }
+    return out.ifEmpty { listOf(text) }
+  }
+
+  /**
+   * Groups a paragraph's glyphs into per-line tight bounding boxes (normalized 0..1),
+   * then stretches each line's height down to the next line so the highlight is one
+   * continuous block with no inter-line gaps.
+   */
   private fun groupLines(glyphs: List<GlyphStripper.Glyph>): List<LineRect> {
     if (glyphs.isEmpty()) return emptyList()
     val rects = ArrayList<LineRect>()
@@ -529,6 +563,14 @@ class DocumentModule(
       if (g.y + g.h > maxY) maxY = g.y + g.h
     }
     push()
+
+    // Fill the leading between consecutive lines so the block reads as continuous.
+    for (i in 0 until rects.size - 1) {
+      val gap = rects[i + 1].y - rects[i].y
+      if (gap > rects[i].h && gap < rects[i].h * 2.5f) {
+        rects[i] = rects[i].copy(h = gap)
+      }
+    }
     return rects
   }
 
