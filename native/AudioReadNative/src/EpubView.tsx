@@ -23,7 +23,8 @@ type EpubViewProps = {
 };
 
 // Injected once the book loads. It groups the whole book's text into sentence-like
-// units (ending at . ! ? or at a block boundary), wraps every word in a span tagged
+// units (ending at . ! ? — minus common abbreviations — or at a block boundary),
+// wraps every word in a span tagged
 // with its unit index (data-p) and char offset within that unit's text (data-c),
 // reports those units to React Native (the single TTS source of truth), and exposes:
 //   arHighlight(p)       -> soft highlight over unit p (+ autoscroll)
@@ -96,6 +97,21 @@ const buildInjectedScript = (dark: boolean) => `
         frag.appendChild(document.createTextNode(' '));
       }
     }
+    // Common abbreviations whose trailing '.' must NOT end a sentence unit,
+    // otherwise "Mr.", "Mrs.", initials, etc. cause a jarring mid-sentence pause.
+    var ABBR = {mr:1,mrs:1,ms:1,dr:1,st:1,sr:1,jr:1,prof:1,gen:1,col:1,sgt:1,
+      capt:1,lt:1,cpl:1,maj:1,rev:1,hon:1,pres:1,messrs:1,mt:1,ft:1,etc:1,vs:1,
+      no:1,al:1,fig:1,vol:1,ch:1,pp:1,inc:1,ltd:1,co:1,corp:1,dept:1,est:1,
+      approx:1,'e.g':1,'i.e':1,'a.m':1,'p.m':1};
+    function endsSentence(word){
+      if (/[!?]["')\\]]*$/.test(word)) return true;     // ! or ? always end a unit
+      if (!/\\.["')\\]]*$/.test(word)) return false;     // no terminal '.' -> not an end
+      var core = word.replace(/["')\\]]+$/, '').slice(0, -1); // strip closers + the '.'
+      if (/^[A-Za-z]$/.test(core)) return false;         // single initial e.g. "J."
+      if (/^([A-Za-z]\\.)+[A-Za-z]$/.test(core)) return false; // dotted form e.g. "U.S."
+      if (ABBR[core.toLowerCase()]) return false;        // known abbreviation
+      return true;
+    }
     textNodes.forEach(function(tn){
       var blk = blockOf(tn);
       if (blk !== curBlock) {
@@ -118,7 +134,7 @@ const buildInjectedScript = (dark: boolean) => `
           span.textContent = word;
           frag.appendChild(span);
           curText += word;
-          if (/[.!?]["')\\]]*$/.test(word)) finishUnit();
+          if (endsSentence(word)) finishUnit();
         }
       }
       if (tn.parentNode) tn.parentNode.replaceChild(frag, tn);
