@@ -267,6 +267,12 @@ function App() {
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [moveBook, setMoveBook] = useState<LibraryBook | null>(null);
+  // Long-press selection -> shows a contextual action bar at the top of the library.
+  const [selection, setSelection] = useState<
+    | {kind: 'book'; book: LibraryBook}
+    | {kind: 'folder'; folder: Folder}
+    | null
+  >(null);
   const [view, setView] = useState<'library' | 'reader'>('library');
   const [activeBookId, setActiveBookId] = useState<string | null>(null);
   const [documentTitle, setDocumentTitle] = useState('');
@@ -378,6 +384,7 @@ function App() {
           onPress: () => {
             void (async () => {
               try {
+                setSelection(null);
                 await DocumentReader.deleteFolder(folder.id);
                 if (currentFolderId === folder.id) setCurrentFolderId(null);
                 await refreshLibrary();
@@ -393,6 +400,7 @@ function App() {
 
   const moveBookTo = async (book: LibraryBook, folderId: string | null) => {
     setMoveBook(null);
+    setSelection(null);
     try {
       const updated = await DocumentReader.moveDocument(book.id, folderId);
       updateBookInState(updated);
@@ -674,6 +682,7 @@ function App() {
 
   const openLibraryBook = async (book: LibraryBook) => {
     try {
+      setSelection(null);
       recordLog(`ui library book pressed id=${book.id}`);
       setBusy(true);
       setStatus('Opening book...');
@@ -690,6 +699,7 @@ function App() {
 
   const deleteBook = async (book: LibraryBook) => {
     try {
+      setSelection(null);
       await DocumentReader.deleteLibraryDocument(book.id);
       setLibrary(items => items.filter(item => item.id !== book.id));
       if (activeBookId === book.id) {
@@ -891,61 +901,58 @@ function App() {
       ? Math.max(0, Math.min(100, Math.round(((book.lastPosition + 1) / book.sentenceCount) * 100)))
       : 0;
 
-  const renderBookItem = ({item}: {item: LibraryBook}) => (
-    <Pressable
-      style={({pressed}) => [styles.bookRow, pressed && styles.pressed]}
-      onPress={() => openLibraryBook(item)}>
-      <View style={styles.bookCover}>
-        <Text style={styles.bookCoverKind}>{item.kind.toUpperCase()}</Text>
-      </View>
-      <View style={styles.bookInfo}>
-        <Text style={styles.bookTitle} numberOfLines={2}>
-          {item.title}
-        </Text>
-        <Text style={styles.bookMeta} numberOfLines={1}>
-          {item.sentenceCount} sections · {bookProgress(item)}% read
-        </Text>
-        <View style={styles.bookProgressTrack}>
-          <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
+  const renderBookItem = ({item}: {item: LibraryBook}) => {
+    const selected = selection?.kind === 'book' && selection.book.id === item.id;
+    return (
+      <Pressable
+        style={({pressed}) => [
+          styles.bookRow,
+          selected && styles.rowSelected,
+          pressed && styles.pressed,
+        ]}
+        onPress={() => openLibraryBook(item)}
+        onLongPress={() => setSelection({kind: 'book', book: item})}
+        delayLongPress={350}>
+        <View style={styles.bookCover}>
+          <Text style={styles.bookCoverKind}>{item.kind.toUpperCase()}</Text>
         </View>
-        <Text style={styles.localPill} numberOfLines={1}>
-          Local system voice
-        </Text>
-      </View>
-      <View style={styles.bookActions}>
-        <Pressable
-          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
-          onPress={event => {
-            event.stopPropagation();
-            setMoveBook(item);
-          }}
-          disabled={busy || playing}
-          hitSlop={8}>
-          <Text style={styles.rowIconText}>↪</Text>
-        </Pressable>
-        <Pressable
-          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
-          onPress={event => {
-            event.stopPropagation();
-            void deleteBook(item);
-          }}
-          disabled={busy || playing}
-          hitSlop={8}>
-          <Text style={styles.rowIconText}>×</Text>
-        </Pressable>
-      </View>
-    </Pressable>
-  );
+        <View style={styles.bookInfo}>
+          <Text style={styles.bookTitle} numberOfLines={2}>
+            {item.title}
+          </Text>
+          <Text style={styles.bookMeta} numberOfLines={1}>
+            {item.sentenceCount} sections · {bookProgress(item)}% read
+          </Text>
+          <View style={styles.bookProgressTrack}>
+            <View style={[styles.bookProgressFill, {width: `${bookProgress(item)}%`}]} />
+          </View>
+          <Text style={styles.localPill} numberOfLines={1}>
+            Local system voice
+          </Text>
+        </View>
+      </Pressable>
+    );
+  };
 
   const renderFolderItem = (folder: Folder) => {
     const count = library.filter(b => b.folderId === folder.id).length;
+    const selected = selection?.kind === 'folder' && selection.folder.id === folder.id;
     return (
       <Pressable
         key={folder.id}
-        style={({pressed}) => [styles.folderRow, pressed && styles.pressed]}
-        onPress={() => setCurrentFolderId(folder.id)}>
+        style={({pressed}) => [
+          styles.folderRow,
+          selected && styles.rowSelected,
+          pressed && styles.pressed,
+        ]}
+        onPress={() => {
+          setSelection(null);
+          setCurrentFolderId(folder.id);
+        }}
+        onLongPress={() => setSelection({kind: 'folder', folder})}
+        delayLongPress={350}>
         <View style={styles.folderIcon}>
-          <Text style={styles.folderIconText}>🗀</Text>
+          <Text style={styles.folderIconText}>📁</Text>
         </View>
         <View style={styles.bookInfo}>
           <Text style={styles.bookTitle} numberOfLines={1}>
@@ -955,16 +962,6 @@ function App() {
             {count} {count === 1 ? 'item' : 'items'}
           </Text>
         </View>
-        <Pressable
-          style={({pressed}) => [styles.rowIconButton, pressed && styles.pressed]}
-          onPress={event => {
-            event.stopPropagation();
-            deleteFolderNow(folder);
-          }}
-          disabled={busy || playing}
-          hitSlop={8}>
-          <Text style={styles.rowIconText}>×</Text>
-        </Pressable>
       </Pressable>
     );
   };
@@ -994,29 +991,62 @@ function App() {
     return (
       <SafeAreaView style={styles.screen} edges={['top']}>
         <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} backgroundColor={colors.bg} />
-        <View style={styles.libraryHeader}>
-          <View style={styles.headerTitleRow}>
-            {currentFolder ? (
+        {selection ? (
+          <View style={[styles.libraryHeader, styles.actionBar]}>
+            <Pressable
+              style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]}
+              onPress={() => setSelection(null)}
+              hitSlop={10}>
+              <Text style={styles.actionBarClose}>✕</Text>
+            </Pressable>
+            <Text style={[styles.title, styles.actionBarTitle]} numberOfLines={1}>
+              {selection.kind === 'book' ? selection.book.title : selection.folder.name}
+            </Text>
+            {selection.kind === 'book' ? (
               <Pressable
-                style={({pressed}) => [styles.backButton, pressed && styles.pressed]}
-                onPress={() => setCurrentFolderId(null)}
+                style={({pressed}) => [styles.actionIcon, pressed && styles.pressed]}
+                onPress={() => setMoveBook(selection.book)}
                 hitSlop={8}>
-                <Text style={styles.backButtonText}>‹</Text>
+                <Text style={styles.actionIconText}>📁</Text>
               </Pressable>
             ) : null}
-            <View style={styles.headerText}>
-              <Text style={styles.title} numberOfLines={1}>
-                {currentFolder ? currentFolder.name : 'Audio Read'}
-              </Text>
-              <Text style={styles.subtitle}>
-                {currentFolder ? 'Folder' : 'Library'}
-              </Text>
-            </View>
+            <Pressable
+              style={({pressed}) => [styles.actionIcon, pressed && styles.pressed]}
+              onPress={() =>
+                selection.kind === 'book'
+                  ? void deleteBook(selection.book)
+                  : deleteFolderNow(selection.folder)
+              }
+              disabled={busy || playing}
+              hitSlop={8}>
+              <Text style={styles.actionIconText}>🗑</Text>
+            </Pressable>
           </View>
-          <Pressable style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]} onPress={() => setShowMenu(true)} hitSlop={10}>
-            <Text style={styles.kebabText}>⋮</Text>
-          </Pressable>
-        </View>
+        ) : (
+          <View style={styles.libraryHeader}>
+            <View style={styles.headerTitleRow}>
+              {currentFolder ? (
+                <Pressable
+                  style={({pressed}) => [styles.backButton, pressed && styles.pressed]}
+                  onPress={() => setCurrentFolderId(null)}
+                  hitSlop={8}>
+                  <Text style={styles.backButtonText}>‹</Text>
+                </Pressable>
+              ) : null}
+              <View style={styles.headerText}>
+                <Text style={styles.title} numberOfLines={1}>
+                  {currentFolder ? currentFolder.name : 'Audio Read'}
+                </Text>
+                <Text style={styles.subtitle}>
+                  {currentFolder ? 'Folder' : 'Library'}
+                </Text>
+              </View>
+            </View>
+            <Pressable style={({pressed}) => [styles.kebabButton, pressed && styles.pressed]} onPress={() => setShowMenu(true)} hitSlop={10}>
+              <Text style={styles.kebabText}>⋮</Text>
+            </Pressable>
+          </View>
+        )}
 
         <FlatList
           data={visibleBooks}
@@ -1555,6 +1585,33 @@ function makeStyles(colors: typeof lightColors) {
     },
     pressed: {
       opacity: 0.62,
+    },
+    rowSelected: {
+      borderColor: colors.accent,
+      borderWidth: 2,
+    },
+    actionBar: {
+      gap: 8,
+    },
+    actionBarClose: {
+      color: colors.text,
+      fontSize: 20,
+      fontWeight: '800',
+    },
+    actionBarTitle: {
+      flex: 1,
+      fontSize: 17,
+    },
+    actionIcon: {
+      width: 42,
+      height: 42,
+      borderRadius: 21,
+      backgroundColor: colors.surface2,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    actionIconText: {
+      fontSize: 18,
     },
     headerTitleRow: {
       flex: 1,
