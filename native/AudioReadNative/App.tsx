@@ -966,12 +966,27 @@ function App() {
             currentPage={pdfCurrentPage}
             activeBox={activePdfBox}
             activeWordStart={activeWordStart}
+            activeWordIndex={activeWordCount - 1}
             colors={colors}
-            onSelectPage={page => {
-              const idx = pdfBoxes.findIndex(b => b && b.page === page);
+            onSeekToPoint={(page, nx, ny) => {
+              // Seek to the paragraph the tap actually landed in; fall back to the first
+              // paragraph on that page, then to proportional paging.
+              const hit = pdfBoxes.findIndex(
+                b =>
+                  b != null &&
+                  b.page === page &&
+                  b.rects.some(
+                    r => nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h,
+                  ),
+              );
+              if (hit >= 0) {
+                skipTo(hit);
+                return;
+              }
+              const firstOnPage = pdfBoxes.findIndex(b => b != null && b.page === page);
               skipTo(
-                idx >= 0
-                  ? idx
+                firstOnPage >= 0
+                  ? firstOnPage
                   : Math.floor((page / Math.max(1, pageCount)) * sentences.length),
               );
             }}

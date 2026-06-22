@@ -39,6 +39,7 @@ type PdfViewProps = {
   currentPage: number;
   activeBox?: PdfBox | null;
   activeWordStart?: number;
+  activeWordIndex?: number;
   colors: {
     bg: string;
     surface: string;
@@ -48,7 +49,7 @@ type PdfViewProps = {
     border: string;
     accent2: string;
   };
-  onSelectPage: (page: number) => void;
+  onSeekToPoint: (page: number, nx: number, ny: number) => void;
   onError?: (message: string) => void;
 };
 
@@ -65,7 +66,9 @@ function PdfPage({
   active,
   activeBox,
   activeWordStart,
+  activeWordIndex,
   colors,
+  onTap,
   onError,
 }: {
   bookId: string;
@@ -74,7 +77,9 @@ function PdfPage({
   active: boolean;
   activeBox?: PdfBox | null;
   activeWordStart?: number;
+  activeWordIndex?: number;
   colors: PdfViewProps['colors'];
+  onTap?: (nx: number, ny: number) => void;
   onError?: (message: string) => void;
 }) {
   const [page, setPage] = useState<RenderedPage | null>(null);
@@ -114,56 +119,72 @@ function PdfPage({
         </View>
       ) : null}
       {page ? (
-        <View style={{width: displayWidth, height}}>
-          <Image
-            source={{uri: page.uri}}
-            style={{width: displayWidth, height}}
-            resizeMode="contain"
-          />
-          {active && activeBox ? (
-            <>
-              {activeBox.rects.map((r, i) =>
-                r.w > 0 && r.h > 0 ? (
-                  <View
-                    key={`r${i}`}
-                    pointerEvents="none"
-                    style={[
-                      styles.highlight,
-                      {
-                        left: r.x * displayWidth,
-                        top: r.y * height,
-                        width: r.w * displayWidth,
-                        height: r.h * height,
-                        backgroundColor: BLOCK_COLOR,
-                      },
-                    ]}
-                  />
-                ) : null,
-              )}
-              {(() => {
-                const ws = activeWordStart ?? -1;
-                if (ws < 0) return null;
-                const word = activeBox.words.find(w => ws >= w.start && ws < w.end);
-                if (!word || word.w <= 0 || word.h <= 0) return null;
-                return (
-                  <View
-                    pointerEvents="none"
-                    style={[
-                      styles.highlight,
-                      {
-                        left: word.x * displayWidth,
-                        top: word.y * height,
-                        width: word.w * displayWidth,
-                        height: word.h * height,
-                        backgroundColor: WORD_COLOR,
-                      },
-                    ]}
-                  />
-                );
-              })()}
-            </>
-          ) : null}
-        </View>
+        <Pressable
+          onPress={e => {
+            const {locationX, locationY} = e.nativeEvent;
+            onTap?.(
+              Math.min(1, Math.max(0, locationX / displayWidth)),
+              Math.min(1, Math.max(0, locationY / height)),
+            );
+          }}>
+          <View style={{width: displayWidth, height}}>
+            <Image
+              source={{uri: page.uri}}
+              style={{width: displayWidth, height}}
+              resizeMode="contain"
+            />
+            {active && activeBox ? (
+              <>
+                {activeBox.rects.map((r, i) =>
+                  r.w > 0 && r.h > 0 ? (
+                    <View
+                      key={`r${i}`}
+                      pointerEvents="none"
+                      style={[
+                        styles.highlight,
+                        {
+                          left: r.x * displayWidth,
+                          top: r.y * height,
+                          width: r.w * displayWidth,
+                          height: r.h * height,
+                          backgroundColor: BLOCK_COLOR,
+                        },
+                      ]}
+                    />
+                  ) : null,
+                )}
+                {(() => {
+                  // Prefer the exact word from TTS onRangeStart; fall back to the timing
+                  // estimate (activeWordIndex) when the engine doesn't report ranges.
+                  const ws = activeWordStart ?? -1;
+                  const words = activeBox.words;
+                  let word =
+                    ws >= 0 ? words.find(w => ws >= w.start && ws < w.end) : undefined;
+                  if (!word) {
+                    const idx = activeWordIndex ?? -1;
+                    if (idx >= 0 && idx < words.length) word = words[idx];
+                  }
+                  if (!word || word.w <= 0 || word.h <= 0) return null;
+                  return (
+                    <View
+                      pointerEvents="none"
+                      style={[
+                        styles.highlight,
+                        {
+                          left: word.x * displayWidth,
+                          top: word.y * height,
+                          width: word.w * displayWidth,
+                          height: word.h * height,
+                          backgroundColor: WORD_COLOR,
+                        },
+                      ]}
+                    />
+                  );
+                })()}
+              </>
+            ) : null}
+          </View>
+        </Pressable>
       ) : (
         <View style={[styles.placeholder, {height: estimatedPageHeight}]}>
           {failed ? (
@@ -186,8 +207,9 @@ function PdfView({
   currentPage,
   activeBox,
   activeWordStart,
+  activeWordIndex,
   colors,
-  onSelectPage,
+  onSeekToPoint,
   onError,
 }: PdfViewProps) {
   const listRef = useRef<FlatList<number>>(null);
@@ -220,7 +242,7 @@ function PdfView({
         activeBox && activeBox.rects[0]
           ? `${activeBox.rects[0].y},${activeBox.rects.length}`
           : ''
-      }:${activeWordStart ?? -1}`}
+      }:${activeWordStart ?? -1}:${activeWordIndex ?? -1}`}
       keyExtractor={index => String(index)}
       style={{backgroundColor: colors.bg}}
       contentContainerStyle={styles.content}
@@ -236,18 +258,18 @@ function PdfView({
         });
       }}
       renderItem={({item}) => (
-        <Pressable onPress={() => onSelectPage(item)}>
-          <PdfPage
-            bookId={bookId}
-            pageIndex={item}
-            total={pageCount}
-            active={item === currentPage}
-            activeBox={item === currentPage ? activeBox : null}
-            activeWordStart={item === currentPage ? activeWordStart : -1}
-            colors={colors}
-            onError={onError}
-          />
-        </Pressable>
+        <PdfPage
+          bookId={bookId}
+          pageIndex={item}
+          total={pageCount}
+          active={item === currentPage}
+          activeBox={item === currentPage ? activeBox : null}
+          activeWordStart={item === currentPage ? activeWordStart : -1}
+          activeWordIndex={item === currentPage ? activeWordIndex : -1}
+          colors={colors}
+          onTap={(nx, ny) => onSeekToPoint(item, nx, ny)}
+          onError={onError}
+        />
       )}
     />
   );
