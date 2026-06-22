@@ -25,13 +25,20 @@ type DocumentReaderModule = {
 const DocumentReader = NativeModules.DocumentReader as DocumentReaderModule;
 
 type PdfRect = {x: number; y: number; w: number; h: number};
-type PdfBox = {page: number; rects: PdfRect[]};
+type PdfWord = {x: number; y: number; w: number; h: number; start: number; end: number};
+type PdfBox = {page: number; rects: PdfRect[]; words: PdfWord[]};
+
+// Graceful, Speechify-like blue: a soft block behind the whole paragraph and a stronger
+// fill on the word being spoken. PDFs render on white, so these read well in both themes.
+const BLOCK_COLOR = 'rgba(74,144,255,0.16)';
+const WORD_COLOR = 'rgba(74,144,255,0.42)';
 
 type PdfViewProps = {
   bookId: string;
   pageCount: number;
   currentPage: number;
   activeBox?: PdfBox | null;
+  activeWordStart?: number;
   colors: {
     bg: string;
     surface: string;
@@ -57,6 +64,7 @@ function PdfPage({
   total,
   active,
   activeBox,
+  activeWordStart,
   colors,
   onError,
 }: {
@@ -65,6 +73,7 @@ function PdfPage({
   total: number;
   active: boolean;
   activeBox?: PdfBox | null;
+  activeWordStart?: number;
   colors: PdfViewProps['colors'];
   onError?: (message: string) => void;
 }) {
@@ -111,11 +120,12 @@ function PdfPage({
             style={{width: displayWidth, height}}
             resizeMode="contain"
           />
-          {active && activeBox
-            ? activeBox.rects.map((r, i) =>
+          {active && activeBox ? (
+            <>
+              {activeBox.rects.map((r, i) =>
                 r.w > 0 && r.h > 0 ? (
                   <View
-                    key={i}
+                    key={`r${i}`}
                     pointerEvents="none"
                     style={[
                       styles.highlight,
@@ -124,13 +134,35 @@ function PdfPage({
                         top: r.y * height,
                         width: r.w * displayWidth,
                         height: r.h * height,
-                        backgroundColor: colors.accent2 + '4D',
+                        backgroundColor: BLOCK_COLOR,
                       },
                     ]}
                   />
                 ) : null,
-              )
-            : null}
+              )}
+              {(() => {
+                const ws = activeWordStart ?? -1;
+                if (ws < 0) return null;
+                const word = activeBox.words.find(w => ws >= w.start && ws < w.end);
+                if (!word || word.w <= 0 || word.h <= 0) return null;
+                return (
+                  <View
+                    pointerEvents="none"
+                    style={[
+                      styles.highlight,
+                      {
+                        left: word.x * displayWidth,
+                        top: word.y * height,
+                        width: word.w * displayWidth,
+                        height: word.h * height,
+                        backgroundColor: WORD_COLOR,
+                      },
+                    ]}
+                  />
+                );
+              })()}
+            </>
+          ) : null}
         </View>
       ) : (
         <View style={[styles.placeholder, {height: estimatedPageHeight}]}>
@@ -153,6 +185,7 @@ function PdfView({
   pageCount,
   currentPage,
   activeBox,
+  activeWordStart,
   colors,
   onSelectPage,
   onError,
@@ -185,9 +218,9 @@ function PdfView({
       data={pages}
       extraData={`${currentPage}:${
         activeBox && activeBox.rects[0]
-          ? `${activeBox.rects[0].x},${activeBox.rects[0].y},${activeBox.rects.length}`
+          ? `${activeBox.rects[0].y},${activeBox.rects.length}`
           : ''
-      }`}
+      }:${activeWordStart ?? -1}`}
       keyExtractor={index => String(index)}
       style={{backgroundColor: colors.bg}}
       contentContainerStyle={styles.content}
@@ -210,6 +243,7 @@ function PdfView({
             total={pageCount}
             active={item === currentPage}
             activeBox={item === currentPage ? activeBox : null}
+            activeWordStart={item === currentPage ? activeWordStart : -1}
             colors={colors}
             onError={onError}
           />

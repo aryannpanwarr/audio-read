@@ -301,6 +301,12 @@ class SystemTtsModule(
   private val listener = object : UtteranceProgressListener() {
     override fun onStart(utteranceId: String?) = Unit
 
+    // Exact per-word callback (API 26+): start/end are char offsets into the spoken text,
+    // letting the UI highlight the precise word being read (Speechify-style word tracking).
+    override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+      emitSpeechRange(start, end)
+    }
+
     override fun onDone(utteranceId: String?) {
       val id = utteranceId ?: return
       val state = utterances.remove(id) ?: return
@@ -396,6 +402,16 @@ class SystemTtsModule(
     reactContext
       .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
       .emit("AudioReadPlaybackCommand", command)
+  }
+
+  private fun emitSpeechRange(start: Int, end: Int) {
+    val map = Arguments.createMap().apply {
+      putInt("start", start)
+      putInt("end", end)
+    }
+    reactContext
+      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      .emit("AudioReadSpeechRange", map)
   }
 
   private fun emitSpeechTiming(audioDuration: Double, wordCount: Int) {

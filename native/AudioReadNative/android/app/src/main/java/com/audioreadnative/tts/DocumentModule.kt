@@ -413,6 +413,18 @@ class DocumentModule(
               })
             }
             putArray("rects", rects)
+            val words = Arguments.createArray()
+            s.words.forEach { wd ->
+              words.pushMap(Arguments.createMap().apply {
+                putDouble("x", wd.x.toDouble())
+                putDouble("y", wd.y.toDouble())
+                putDouble("w", wd.w.toDouble())
+                putDouble("h", wd.h.toDouble())
+                putInt("start", wd.start)
+                putInt("end", wd.end)
+              })
+            }
+            putArray("words", words)
           })
         }
         LogStore.write(DOCUMENT_TAG, "pdf sentence boxes id=$id count=${sentences.size}")
@@ -437,32 +449,60 @@ class DocumentModule(
    */
   private fun buildPdfSentences(glyphs: List<GlyphStripper.Glyph>): List<PdfSentence> {
     val out = ArrayList<PdfSentence>()
-    val sb = StringBuilder()
     val pending = ArrayList<GlyphStripper.Glyph>()
+    val paraWords = ArrayList<WordBox>()
+    val curWord = ArrayList<GlyphStripper.Glyph>()
     var page = -1
-    var lastSpace = true
     var lineY = 0f
     var lineH = 0f
     var lineAdvance = 0f
     var hasLine = false
 
+    fun closeWord() {
+      if (curWord.isEmpty()) return
+      var minX = Float.MAX_VALUE
+      var minY = Float.MAX_VALUE
+      var maxX = -Float.MAX_VALUE
+      var maxY = -Float.MAX_VALUE
+      val text = StringBuilder()
+      for (g in curWord) {
+        text.append(g.c)
+        if (g.x < minX) minX = g.x
+        if (g.y < minY) minY = g.y
+        if (g.x + g.w > maxX) maxX = g.x + g.w
+        if (g.y + g.h > maxY) maxY = g.y + g.h
+      }
+      paraWords.add(
+        WordBox(
+          text.toString(),
+          minX.coerceIn(0f, 1f),
+          minY.coerceIn(0f, 1f),
+          (maxX - minX).coerceIn(0f, 1f),
+          (maxY - minY).coerceIn(0f, 1f),
+        ),
+      )
+      curWord.clear()
+    }
+
     fun flushPara() {
-      val text = sb.toString().trim()
-      if (text.length >= 2 && text.any { it.isLetterOrDigit() } && !isPageNumber(text)) {
+      closeWord()
+      val paraText = paraWords.joinToString(" ") { it.text }.trim()
+      if (paraText.length >= 2 && paraText.any { it.isLetterOrDigit() } && !isPageNumber(paraText)) {
         val rects = groupLines(pending)
         if (rects.isNotEmpty()) {
-          for (chunk in chunkParagraph(text)) {
-            out.add(PdfSentence(chunk, if (page < 0) 0 else page, rects))
+          val p = if (page < 0) 0 else page
+          for (unit in chunkWords(paraWords)) {
+            out.add(buildUnit(unit, p, rects))
           }
         }
       }
-      sb.setLength(0); pending.clear(); page = -1
-      lastSpace = true; hasLine = false; lineAdvance = 0f
+      pending.clear(); paraWords.clear(); page = -1
+      hasLine = false; lineAdvance = 0f
     }
 
     for (g in glyphs) {
       if (g.sep) {
-        if (!lastSpace) { sb.append(' '); lastSpace = true }
+        closeWord()
         continue
       }
       if (hasLine && page >= 0) {
@@ -474,11 +514,14 @@ class DocumentModule(
             advance < -tol * 0.5f || // jumped up -> new column / region
             (lineAdvance > 0f && advance > lineAdvance * 1.6f) || // gap >> normal leading
             (lineAdvance <= 0f && advance > tol * 2.2f) // first gap, clearly large
-          if (paragraphBreak && sb.toString().any { it.isLetterOrDigit() }) {
+          if (paragraphBreak && paraWords.isNotEmpty()) {
             flushPara()
-          } else if (advance > 0f) {
-            // Normal next line: learn this paragraph's typical line spacing.
-            lineAdvance = if (lineAdvance > 0f) lineAdvance * 0.5f + advance * 0.5f else advance
+          } else {
+            // Same paragraph, next line: a line break separates words.
+            closeWord()
+            if (advance > 0f) {
+              lineAdvance = if (lineAdvance > 0f) lineAdvance * 0.5f + advance * 0.5f else advance
+            }
           }
         }
       }
@@ -488,33 +531,43 @@ class DocumentModule(
       } else if (g.page == page && kotlin.math.abs(g.y - lineY) > (if (g.h > 0f) g.h else 0.012f) * 0.5f) {
         lineY = g.y; lineH = if (g.h > 0f) g.h else lineH
       }
-      sb.append(g.c); lastSpace = false
+      curWord.add(g)
       if (g.page == page) pending.add(g)
     }
     flushPara()
     return if (out.size > 8000) out.subList(0, 8000) else out
   }
 
-  /** Splits an over-long paragraph at sentence ends so one TTS utterance stays sane. */
-  private fun chunkParagraph(text: String): List<String> {
-    if (text.length <= 1400) return listOf(text)
-    val out = ArrayList<String>()
-    val cur = StringBuilder()
-    for (c in text) {
-      cur.append(c)
-      if ((c == '.' || c == '!' || c == '?') && cur.length >= 700) {
-        out.add(cur.toString().trim()); cur.setLength(0)
-      }
+  /** Joins a unit's words into one string and records each word's char span + box. */
+  private fun buildUnit(words: List<WordBox>, page: Int, rects: List<LineRect>): PdfSentence {
+    val sb = StringBuilder()
+    val spans = ArrayList<WordSpan>()
+    for (w in words) {
+      if (sb.isNotEmpty()) sb.append(' ')
+      val start = sb.length
+      sb.append(w.text)
+      spans.add(WordSpan(w.x, w.y, w.w, w.h, start, sb.length))
     }
-    val tail = cur.toString().trim()
-    if (tail.isNotEmpty()) {
-      if (out.isNotEmpty() && tail.length < 200) {
-        out[out.lastIndex] = (out.last() + " " + tail).trim()
-      } else {
-        out.add(tail)
-      }
+    return PdfSentence(sb.toString(), page, rects, spans)
+  }
+
+  /** Splits an over-long paragraph into units at sentence ends so a TTS utterance stays sane. */
+  private fun chunkWords(words: List<WordBox>): List<List<WordBox>> {
+    val total = words.sumOf { it.text.length + 1 }
+    if (total <= 1400) return listOf(words)
+    val out = ArrayList<List<WordBox>>()
+    var cur = ArrayList<WordBox>()
+    var len = 0
+    for (w in words) {
+      cur.add(w); len += w.text.length + 1
+      val endsSentence = w.text.lastOrNull()?.let { it == '.' || it == '!' || it == '?' } == true
+      if (endsSentence && len >= 700) { out.add(cur); cur = ArrayList(); len = 0 }
     }
-    return out.ifEmpty { listOf(text) }
+    if (cur.isNotEmpty()) {
+      if (out.isNotEmpty() && len < 200) out[out.lastIndex] = out.last() + cur
+      else out.add(cur)
+    }
+    return out.ifEmpty { listOf(words) }
   }
 
   /**
@@ -868,10 +921,28 @@ private data class LineRect(
   val h: Float,
 )
 
+private data class WordBox(
+  val text: String,
+  val x: Float,
+  val y: Float,
+  val w: Float,
+  val h: Float,
+)
+
+private data class WordSpan(
+  val x: Float,
+  val y: Float,
+  val w: Float,
+  val h: Float,
+  val start: Int,
+  val end: Int,
+)
+
 private data class PdfSentence(
   val text: String,
   val page: Int,
   val rects: List<LineRect>,
+  val words: List<WordSpan>,
 )
 
 /**

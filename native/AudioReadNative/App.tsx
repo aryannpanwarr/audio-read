@@ -109,9 +109,11 @@ type DocumentReaderModule = {
   getPdfSentenceBoxes(id: string): Promise<PdfSentenceBox[]>;
 };
 
-// A sentence's per-line tight rectangles (normalized 0..1 of the page) on a PDF page.
+// A paragraph's per-line rectangles (the soft block) + per-word boxes with the char
+// span they cover in the spoken text (for exact Speechify-style word highlighting).
 type PdfRect = {x: number; y: number; w: number; h: number};
-type PdfBox = {page: number; rects: PdfRect[]};
+type PdfWord = {x: number; y: number; w: number; h: number; start: number; end: number};
+type PdfBox = {page: number; rects: PdfRect[]; words: PdfWord[]};
 type PdfSentenceBox = PdfBox & {text: string};
 
 const SystemTts = NativeModules.SystemTts as SystemTtsModule;
@@ -268,6 +270,9 @@ function App() {
   const [epubBaseUrl, setEpubBaseUrl] = useState('');
   const [pageCount, setPageCount] = useState(0);
   const [pdfBoxes, setPdfBoxes] = useState<(PdfBox | null)[]>([]);
+  // Char offset of the word currently being spoken, into the active sentence's text
+  // (from Android TTS onRangeStart). -1 = none. Used to highlight the exact word.
+  const [activeWordStart, setActiveWordStart] = useState(-1);
   const listRef = useRef<FlatList<Sentence>>(null);
   const commandHandlerRef = useRef<(command: string) => void>(() => {});
   const timingHandlerRef = useRef<(timing: SpeechTiming) => void>(() => {});
@@ -290,6 +295,7 @@ function App() {
       wordTimerRef.current = null;
     }
     setActiveWordCount(0);
+    setActiveWordStart(-1);
   }
 
   function startWordProgress(timing: SpeechTiming) {
@@ -370,9 +376,15 @@ function App() {
     const timingSubscription = emitter.addListener('AudioReadSpeechTiming', timing => {
       timingHandlerRef.current(timing as SpeechTiming);
     });
+    // Exact word boundary from Android TTS: the char offset of the word being spoken.
+    const rangeSubscription = emitter.addListener('AudioReadSpeechRange', range => {
+      const start = (range as {start?: number})?.start;
+      if (typeof start === 'number') setActiveWordStart(start);
+    });
     return () => {
       commandSubscription.remove();
       timingSubscription.remove();
+      rangeSubscription.remove();
       clearWordProgress();
     };
   }, []);
@@ -492,7 +504,9 @@ function App() {
             const parsed = boxed.map((b, id) => ({id, text: b.text}));
             setSentences(parsed);
             sentencesRef.current = parsed;
-            setPdfBoxes(boxed.map(b => ({page: b.page, rects: b.rects})));
+            setPdfBoxes(
+              boxed.map(b => ({page: b.page, rects: b.rects, words: b.words})),
+            );
             setCurrent(Math.max(0, Math.min(parsed.length - 1, book.lastPosition || 0)));
             setStatus('Ready to read');
             recordLog(`ui pdf sentence boxes count=${boxed.length}`);
@@ -625,6 +639,7 @@ function App() {
         setCurrent(index);
         persistProgress(index);
         setActiveWordCount(0);
+        setActiveWordStart(-1);
         const speakText = sentence.text.trim();
         if (speakText.length < 2) {
           index += 1;
@@ -950,6 +965,7 @@ function App() {
             pageCount={pageCount}
             currentPage={pdfCurrentPage}
             activeBox={activePdfBox}
+            activeWordStart={activeWordStart}
             colors={colors}
             onSelectPage={page => {
               const idx = pdfBoxes.findIndex(b => b && b.page === page);
