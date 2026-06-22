@@ -230,11 +230,11 @@ function isWord(part: string) {
   return /\S/.test(part);
 }
 
-// Abbreviations whose trailing '.' makes the device TTS engine insert a full
-// sentence-boundary pause ("Ms. Hiratsuka" -> long gap) even when they sit
-// inside one reading unit. For the ultra-common honorifics the engine's lexicon
-// pronounces the bare token correctly, so we just drop the period; the rest we
-// spell out so the word is still read in full once the period is gone.
+// Honorifics whose trailing '.' makes the device TTS engine insert a full
+// sentence-boundary pause ("Ms. Hiratsuka" -> long gap) even inside one reading
+// unit. For the ultra-common ones the engine's lexicon pronounces the bare
+// token correctly, so we just drop the period; the rest we spell out so the
+// word is still read in full once the period is gone.
 const DROP_PERIOD = new Set(['mr', 'mrs', 'ms', 'mx', 'dr', 'st']);
 const EXPAND: Record<string, string> = {
   prof: 'Professor', rev: 'Reverend', gen: 'General', col: 'Colonel',
@@ -242,15 +242,40 @@ const EXPAND: Record<string, string> = {
   hon: 'Honorable', sr: 'Senior', jr: 'Junior', mt: 'Mount',
   messrs: 'Messieurs', vs: 'versus', etc: 'etcetera',
 };
+// Unit abbreviations the engine tends to spell out ("5km" -> "five k m"); only
+// expanded when glued to a number so plain prose words are never touched.
+const UNITS: Record<string, string> = {
+  km: 'kilometers', cm: 'centimeters', mm: 'millimeters', kg: 'kilograms',
+  lbs: 'pounds', lb: 'pounds', ft: 'feet', mph: 'miles per hour',
+  kph: 'kilometers per hour',
+};
 
-// Rewrites the string handed to TTS (drop/expand known abbreviations) while
-// returning an index map: map[i] is the position in `input` that normalized
-// char i came from, so onRangeStart offsets translate back to the on-screen
-// text and the word highlight stays aligned even when lengths change. Only
-// known abbreviations are touched — never arbitrary periods — so real
-// sentence-ending periods inside a unit (PDF paragraphs) are left intact.
+// The spoken form for a matched token, or null to leave it untouched.
+function spokenForm(s: string): string | null {
+  if (/^et al\.$/i.test(s)) return 'and others';
+  if (/^e\.g\.$/i.test(s)) return 'for example';
+  if (/^i\.e\.$/i.test(s)) return 'that is';
+  const u = /^(\d)\s?([A-Za-z]+)$/.exec(s); // digit + unit, e.g. "5km" / "5 km"
+  if (u) return UNITS[u[2].toLowerCase()] ? `${u[1]} ${UNITS[u[2].toLowerCase()]}` : null;
+  const a = /^([A-Za-z]+)\.$/.exec(s); // single abbreviation token + period
+  if (a) {
+    const k = a[1].toLowerCase();
+    if (DROP_PERIOD.has(k)) return a[1];
+    if (EXPAND[k]) return EXPAND[k];
+  }
+  return null;
+}
+
+// Rewrites the string handed to TTS (expand/normalize known abbreviations,
+// units and Latin shorthand) while returning an index map: map[i] is the
+// position in `input` that normalized char i came from, so onRangeStart offsets
+// translate back to the on-screen text and the word highlight stays aligned
+// even when lengths change. Only known tokens are rewritten — never arbitrary
+// words/periods — so real sentence-ending periods inside a unit (PDF
+// paragraphs) and ordinary prose are left intact.
 function normalizeForSpeech(input: string): {text: string; map: number[]} {
-  const re = /\b([A-Za-z]+)\.(?=["')\]]*\s)/g;
+  const re =
+    /et al\.|e\.g\.|i\.e\.|\d\s?(?:km|cm|mm|kg|lbs|lb|ft|mph|kph)\b|\b[A-Za-z]+\.(?=["')\]]*\s)/gi;
   let out = '';
   const map: number[] = [];
   let last = 0;
@@ -262,16 +287,14 @@ function normalizeForSpeech(input: string): {text: string; map: number[]} {
   };
   let m: RegExpExecArray | null;
   while ((m = re.exec(input))) {
-    const word = m[1];
-    const key = word.toLowerCase();
-    const replacement = DROP_PERIOD.has(key) ? word : EXPAND[key] ?? null;
-    if (replacement == null) continue; // unknown abbreviation -> leave untouched
+    const rep = spokenForm(m[0]);
+    if (rep == null) continue; // not a token we rewrite -> leave untouched
     pushVerbatim(last, m.index);
-    for (let k = 0; k < replacement.length; k++) {
-      out += replacement[k];
-      map.push(m.index); // map the whole replacement back to the original word
+    for (let k = 0; k < rep.length; k++) {
+      out += rep[k];
+      map.push(m.index); // map the whole replacement back to the original token
     }
-    last = m.index + word.length + 1; // skip original word + its '.'
+    last = m.index + m[0].length;
   }
   pushVerbatim(last, input.length);
   map.push(input.length); // sentinel so end-of-string offsets still resolve
