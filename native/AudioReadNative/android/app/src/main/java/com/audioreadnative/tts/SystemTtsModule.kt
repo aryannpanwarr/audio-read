@@ -127,7 +127,7 @@ class SystemTtsModule(
         val utteranceId = UUID.randomUUID().toString()
         val startedAt = System.nanoTime()
         val estimatedDuration = estimateDurationSeconds(cleanText, speed)
-        utterances[utteranceId] = UtteranceState(promise, startedAt, estimatedDuration, cleanText.wordCount())
+        utterances[utteranceId] = UtteranceState(promise, startedAt, estimatedDuration, cleanText.wordCount(), cleanText)
         engine.setSpeechRate(speed.toFloat().coerceIn(0.5f, 2.0f))
         selectVoice(engine, voiceName)
         emitSpeechTiming(estimatedDuration, cleanText.wordCount())
@@ -304,13 +304,28 @@ class SystemTtsModule(
     // Exact per-word callback (API 26+): start/end are char offsets into the spoken text,
     // letting the UI highlight the precise word being read (Speechify-style word tracking).
     override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+      val state = utteranceId?.let { utterances[it] }
+      if (state != null) {
+        state.rangeCount++
+        val word = if (start in 0..state.text.length && end in start..state.text.length) {
+          state.text.substring(start, end)
+        } else {
+          "?"
+        }
+        // First few words per utterance only, so logs stay readable but prove ranges fire.
+        if (state.rangeCount <= 6) {
+          LogStore.write(TAG, "range #${state.rangeCount} start=$start end=$end word=\"$word\"")
+        }
+      } else {
+        LogStore.write(TAG, "range start=$start end=$end (no utterance state)")
+      }
       emitSpeechRange(start, end)
     }
 
     override fun onDone(utteranceId: String?) {
       val id = utteranceId ?: return
       val state = utterances.remove(id) ?: return
-      LogStore.write(TAG, "speak done id=$id")
+      LogStore.write(TAG, "speak done id=$id ranges=${state.rangeCount} words=${state.wordCount}")
       state.promise.resolve(state.resultMap("system"))
     }
 
@@ -444,6 +459,8 @@ private data class UtteranceState(
   val startedAt: Long,
   val estimatedAudioDurationSeconds: Double,
   val wordCount: Int,
+  val text: String = "",
+  var rangeCount: Int = 0,
 ) {
   fun resultMap(source: String) = Arguments.createMap().apply {
     val elapsed = (System.nanoTime() - startedAt) / 1_000_000_000.0

@@ -427,7 +427,18 @@ class DocumentModule(
             putArray("words", words)
           })
         }
-        LogStore.write(DOCUMENT_TAG, "pdf sentence boxes id=$id count=${sentences.size}")
+        val sample = sentences.firstOrNull()
+        val sampleInfo = if (sample != null) {
+          "first[lines=${sample.rects.size} words=${sample.words.size} page=${sample.page} " +
+            "text=\"${sample.text.take(40)}\"]"
+        } else {
+          "first[none]"
+        }
+        LogStore.write(
+          DOCUMENT_TAG,
+          "pdf sentence boxes id=$id units=${sentences.size} " +
+            "medianAdvance=${medianLineAdvance(stripper.glyphs)} $sampleInfo",
+        )
         promise.resolve(array)
       } catch (e: Throwable) {
         LogStore.write(DOCUMENT_TAG, "getPdfSentenceBoxes failed id=$id: ${e.stackTraceToString()}")

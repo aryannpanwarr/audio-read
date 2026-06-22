@@ -377,9 +377,17 @@ function App() {
       timingHandlerRef.current(timing as SpeechTiming);
     });
     // Exact word boundary from Android TTS: the char offset of the word being spoken.
+    let rangeEventCount = 0;
     const rangeSubscription = emitter.addListener('AudioReadSpeechRange', range => {
       const start = (range as {start?: number})?.start;
-      if (typeof start === 'number') setActiveWordStart(start);
+      const end = (range as {end?: number})?.end;
+      if (typeof start === 'number') {
+        rangeEventCount += 1;
+        if (rangeEventCount <= 6) {
+          recordLog(`ui range event #${rangeEventCount} start=${start} end=${end}`);
+        }
+        setActiveWordStart(start);
+      }
     });
     return () => {
       commandSubscription.remove();
@@ -433,6 +441,31 @@ function App() {
   const wordsRead = wordsBefore + Math.min(activeWordCount, wordCounts[current] ?? 0);
   const elapsedSeconds = totalWords ? (wordsRead / wordsPerMinute) * 60 : 0;
   const totalSeconds = totalWords ? (totalWords / wordsPerMinute) * 60 : 0;
+
+  // Diagnostic: trace how the PDF word highlight is resolved each time it advances —
+  // exact (onRangeStart) vs estimate fallback, and whether a word box was found.
+  useEffect(() => {
+    if (documentKind !== 'pdf' || !activePdfBox) return;
+    const words = activePdfBox.words;
+    let path = 'none';
+    let found = false;
+    if (activeWordStart >= 0) {
+      const w = words.find(x => activeWordStart >= x.start && activeWordStart < x.end);
+      found = !!w;
+      path = w ? 'exact' : 'exact-nomatch';
+    }
+    if (!found) {
+      const idx = activeWordCount - 1;
+      if (idx >= 0 && idx < words.length) {
+        found = true;
+        path = path === 'exact-nomatch' ? 'exact-nomatch->estimate' : 'estimate';
+      }
+    }
+    recordLog(
+      `pdf word resolve path=${path} found=${found ? 'y' : 'n'} ` +
+        `rangeStart=${activeWordStart} estCount=${activeWordCount} words=${words.length}`,
+    );
+  }, [activeWordStart, activeWordCount, documentKind, activePdfBox]);
 
   // Called by the EPUB WebView once it has wrapped the whole book's text into sentence
   // spans. This is the single source of truth for TTS + highlighting.
@@ -980,15 +1013,21 @@ function App() {
                   ),
               );
               if (hit >= 0) {
+                recordLog(
+                  `pdf tap page=${page} nx=${nx.toFixed(3)} ny=${ny.toFixed(3)} -> hit unit=${hit}`,
+                );
                 skipTo(hit);
                 return;
               }
               const firstOnPage = pdfBoxes.findIndex(b => b != null && b.page === page);
-              skipTo(
+              const fallback =
                 firstOnPage >= 0
                   ? firstOnPage
-                  : Math.floor((page / Math.max(1, pageCount)) * sentences.length),
+                  : Math.floor((page / Math.max(1, pageCount)) * sentences.length);
+              recordLog(
+                `pdf tap page=${page} nx=${nx.toFixed(3)} ny=${ny.toFixed(3)} -> no hit, fallback unit=${fallback}`,
               );
+              skipTo(fallback);
             }}
             onError={handlePdfError}
           />
