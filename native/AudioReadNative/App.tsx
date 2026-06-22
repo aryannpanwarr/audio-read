@@ -230,6 +230,20 @@ function isWord(part: string) {
   return /\S/.test(part);
 }
 
+// Honorifics/abbreviations whose trailing '.' makes the device TTS engine
+// insert a full sentence-boundary pause ("Ms. Hiratsuka" -> long gap), even
+// though we keep them in one reading unit. We blank that period (swap it for a
+// space) only in the string handed to TTS; length is preserved so onRangeStart
+// word offsets still line up with the on-screen text and highlight.
+const ABBREV_RE =
+  /\b(Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|Rev|Hon|Gen|Col|Sgt|Capt|Lt|Cpl|Maj|Messrs|Mt|vs|etc)\.(?=["')\]]*\s)/gi;
+function softenAbbreviations(text: string): string {
+  return text
+    .replace(ABBREV_RE, match => match.slice(0, -1) + ' ')
+    // Initials inside a unit ("J. R. R. Tolkien") pause the engine too.
+    .replace(/\b([A-Za-z])\.(?=["')\]]*\s)/g, '$1 ');
+}
+
 // Music-player style clock: H:MM:SS once past an hour, otherwise M:SS.
 function formatClock(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
@@ -782,7 +796,7 @@ function App() {
         const safeStart = Math.max(0, Math.min(sentence.text.length, requestedStart));
         const leadingWhitespace = sentence.text.slice(safeStart).match(/^\s*/)?.[0].length ?? 0;
         updateActiveWordBase(safeStart + leadingWhitespace);
-        const speakText = sentence.text.slice(safeStart).trimStart();
+        const speakText = softenAbbreviations(sentence.text.slice(safeStart).trimStart());
         if (speakText.length < 2) {
           index += 1;
           continue;
