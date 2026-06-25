@@ -94,6 +94,13 @@ type SystemTtsModule = {
   stop(): Promise<void>;
   startPlaybackSession(): Promise<void>;
   stopPlaybackSession(): Promise<void>;
+  updateNowPlaying(
+    title: string,
+    subtitle: string,
+    isPlaying: boolean,
+    elapsedSeconds: number,
+    totalSeconds: number,
+  ): Promise<void>;
   requestBackgroundPlaybackPermission(): Promise<boolean>;
   record(message: string): Promise<void>;
   exportLogs(): Promise<string>;
@@ -317,6 +324,24 @@ function formatClock(seconds: number) {
 // total/elapsed book length for the player, never for actual timing.
 const BASE_WPM = 160;
 
+// Sleep-timer presets shown as chips in the reader settings menu.
+const SLEEP_OPTIONS: {label: string; minutes: number | null; endOfChapter?: boolean}[] = [
+  {label: 'Off', minutes: null},
+  {label: '5 min', minutes: 5},
+  {label: '15 min', minutes: 15},
+  {label: '30 min', minutes: 30},
+  {label: '45 min', minutes: 45},
+  {label: '60 min', minutes: 60},
+  {label: 'End of chapter', minutes: null, endOfChapter: true},
+];
+
+function formatSleepRemaining(ms: number) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
 function formatTotalLength(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return '—';
   const h = Math.floor(seconds / 3600);
@@ -361,6 +386,15 @@ function App() {
   const [activeWordCount, setActiveWordCount] = useState(0);
   const [showVoices, setShowVoices] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  // True while the foreground media session/notification is live. Stays true across a
+  // pause so the Spotify-style notification persists (paused, resumable from there).
+  const [sessionActive, setSessionActive] = useState(false);
+  // Sleep timer: minutes selected (null = off) and the absolute wall-clock deadline.
+  // `endOfChapter` pauses once the current chapter/heading finishes instead of on a clock.
+  const [sleepMinutes, setSleepMinutes] = useState<number | null>(null);
+  const [sleepEndOfChapter, setSleepEndOfChapter] = useState(false);
+  const [sleepDeadline, setSleepDeadline] = useState<number | null>(null);
+  const [sleepRemainingMs, setSleepRemainingMs] = useState(0);
   const [epubHtml, setEpubHtml] = useState('');
   const [epubBaseUrl, setEpubBaseUrl] = useState('');
   const [pageCount, setPageCount] = useState(0);
@@ -382,6 +416,12 @@ function App() {
   const speechMapRef = useRef<number[] | null>(null);
   const backgroundPermissionPromptedRef = useRef(false);
   const sentencesResolveRef = useRef<((value: Sentence[]) => void) | null>(null);
+  // Latest player progress in book-seconds, read by the now-playing pusher without
+  // re-subscribing on every word tick.
+  const nowPlayingRef = useRef({elapsed: 0, total: 0});
+  // Lets timers/effects trigger the same toggle the UI button uses, without stale closures.
+  const playPauseRef = useRef<() => void>(() => {});
+  const sleepEndOfChapterRef = useRef(false);
 
   const voices = ready?.voices ?? [];
   const selectedVoice = voices[voiceIndex]?.name ?? null;
@@ -389,6 +429,37 @@ function App() {
   function updateBookInState(book: LibraryBook) {
     setLibrary(items => [book, ...items.filter(item => item.id !== book.id)]);
   }
+
+  // Clock-based sleep timer: when armed, tick down each second (see effect below) and
+  // fire a pause at the deadline. Survives manual pause/resume; cleared on stop/leave/finish.
+  const clearSleepTimer = useCallback(() => {
+    setSleepMinutes(null);
+    setSleepEndOfChapter(false);
+    setSleepDeadline(null);
+    setSleepRemainingMs(0);
+  }, []);
+
+  const armSleepTimer = useCallback((minutes: number | null, endOfChapter: boolean) => {
+    if (endOfChapter) {
+      setSleepEndOfChapter(true);
+      setSleepMinutes(null);
+      setSleepDeadline(null);
+      setSleepRemainingMs(0);
+      recordLog('ui sleep timer armed end-of-chapter');
+      return;
+    }
+    if (minutes == null) {
+      clearSleepTimer();
+      recordLog('ui sleep timer off');
+      return;
+    }
+    setSleepEndOfChapter(false);
+    setSleepMinutes(minutes);
+    const deadline = Date.now() + minutes * 60_000;
+    setSleepDeadline(deadline);
+    setSleepRemainingMs(minutes * 60_000);
+    recordLog(`ui sleep timer armed minutes=${minutes}`);
+  }, [clearSleepTimer]);
 
   function clearWordProgress() {
     if (wordTimerRef.current) {
@@ -616,6 +687,12 @@ function App() {
   const wordsRead = wordsBefore + Math.min(activeWordCount, wordCounts[current] ?? 0);
   const elapsedSeconds = totalWords ? (wordsRead / wordsPerMinute) * 60 : 0;
   const totalSeconds = totalWords ? (totalWords / wordsPerMinute) * 60 : 0;
+  const sleepActive = sleepEndOfChapter || sleepDeadline != null;
+  const sleepLabel = sleepEndOfChapter
+    ? 'End of chapter'
+    : sleepDeadline != null
+      ? formatSleepRemaining(sleepRemainingMs)
+      : '';
 
   // Diagnostic: trace how the PDF word highlight is resolved each time it advances —
   // exact (onRangeStart) vs estimate fallback, and whether a word box was found.
@@ -671,7 +748,9 @@ function App() {
   const enterReader = async (book: LibraryBook, text: string) => {
     playGeneration++;
     await SystemTts.stop();
+    setSessionActive(false);
     await SystemTts.stopPlaybackSession();
+    clearSleepTimer();
     clearWordProgress();
     setPlaying(false);
     setActiveBookId(book.id);
@@ -800,7 +879,9 @@ function App() {
       if (activeBookId === book.id) {
         playGeneration++;
         await SystemTts.stop();
+        setSessionActive(false);
         await SystemTts.stopPlaybackSession();
+        clearSleepTimer();
         clearWordProgress();
         setActiveBookId(null);
         setSentences([]);
@@ -832,6 +913,7 @@ function App() {
       void requestBackgroundPermission();
       await ensureReady();
       await SystemTts.startPlaybackSession();
+      setSessionActive(true);
       // The EPUB WebView reports the whole book's sentences asynchronously; wait for
       // them before reading so we don't start on an empty list.
       if (documentKind === 'epub' && !sentencesRef.current.length) {
@@ -849,11 +931,20 @@ function App() {
         if (token !== playGeneration) return;
       }
       let index = startIndex;
+      let sleptAtChapter = false;
       while (true) {
         if (token !== playGeneration) return;
         const segment = sentencesRef.current;
         if (index >= segment.length) break;
         const sentence = segment[index];
+        // End-of-chapter sleep: stop just before the next chapter/heading begins,
+        // leaving the position there so playback resumes at the new chapter.
+        if (sleepEndOfChapterRef.current && index > startIndex && isHeading(sentence.text)) {
+          setCurrent(index);
+          persistProgress(index);
+          sleptAtChapter = true;
+          break;
+        }
         setCurrent(index);
         persistProgress(index);
         setActiveWordCount(0);
@@ -876,15 +967,27 @@ function App() {
         if (token !== playGeneration) return;
         index += 1;
       }
+      if (sleptAtChapter) {
+        // Pause-in-place: keep the media session alive so the notification stays,
+        // showing a paused, resumable card at the new chapter.
+        await SystemTts.stop();
+        setPlaying(false);
+        clearWordProgress();
+        clearSleepTimer();
+        setStatus('Sleep timer · chapter ended');
+        return;
+      }
       setStatus('Finished');
       setPlaying(false);
       clearWordProgress();
+      setSessionActive(false);
       await SystemTts.stopPlaybackSession();
     } catch (error) {
       const message = describeError(error);
       setStatus('Playback failed');
       setPlaying(false);
       clearWordProgress();
+      setSessionActive(false);
       await SystemTts.stopPlaybackSession().catch(() => {});
       Alert.alert('Playback failed', message);
       recordLog(`ui playback failed ${message}`);
@@ -903,9 +1006,10 @@ function App() {
       setPlaying(false);
       setBusy(false);
       await SystemTts.stop();
-      await SystemTts.stopPlaybackSession();
       clearWordProgress();
       setStatus('Paused');
+      // Keep the foreground media session so the notification stays as a paused,
+      // resumable card (Spotify-style). It is torn down on finish / leave / delete.
       return;
     }
     recordLog(`ui play pressed current=${current}`);
@@ -926,7 +1030,7 @@ function App() {
     if (shouldResume) {
       void speakAt(bounded);
     } else {
-      await SystemTts.stopPlaybackSession();
+      // Keep any live session; the now-playing effect refreshes the notification.
       setStatus(`Ready at ${bounded + 1} of ${sentences.length}`);
     }
   };
@@ -958,7 +1062,47 @@ function App() {
       }
     };
     timingHandlerRef.current = startWordProgress;
+    playPauseRef.current = () => void playPause();
+    sleepEndOfChapterRef.current = sleepEndOfChapter;
   });
+
+  // Push the now-playing card (title, passage, play/pause, progress) to the native
+  // MediaStyle notification whenever the meaningful state changes. Progress is read
+  // from a ref (not a dep) so this doesn't refire on every word tick.
+  useEffect(() => {
+    if (!sessionActive) return;
+    const subtitle = sentences.length
+      ? `Passage ${current + 1} of ${sentences.length}`
+      : 'Reading';
+    const {elapsed, total} = nowPlayingRef.current;
+    void SystemTts.updateNowPlaying(
+      documentTitle || 'Audio Read',
+      subtitle,
+      playing,
+      elapsed,
+      total,
+    ).catch(error => recordLog(`ui now-playing update failed ${describeError(error)}`));
+  }, [sessionActive, playing, current, documentTitle, sentences.length]);
+
+  useEffect(() => {
+    nowPlayingRef.current = {elapsed: elapsedSeconds, total: totalSeconds};
+  }, [elapsedSeconds, totalSeconds]);
+
+  useEffect(() => {
+    if (sleepDeadline == null) return;
+    const tick = () => {
+      const remaining = sleepDeadline - Date.now();
+      setSleepRemainingMs(Math.max(0, remaining));
+      if (remaining <= 0) {
+        recordLog('ui sleep timer fired');
+        clearSleepTimer();
+        if (playing) playPauseRef.current();
+      }
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [sleepDeadline, playing, clearSleepTimer]);
 
   const previewVoice = useCallback(async (voice: TtsVoice) => {
     try {
@@ -1482,6 +1626,15 @@ function App() {
           <Text style={[styles.timeText, styles.timeTextRight]}>{formatClock(totalSeconds)}</Text>
         </View>
 
+        {sleepActive ? (
+          <Pressable
+            style={({pressed}) => [styles.sleepIndicator, pressed && styles.pressed]}
+            onPress={() => setShowMenu(true)}
+            hitSlop={6}>
+            <Text style={styles.sleepIndicatorText}>🌙 Sleep · {sleepLabel}</Text>
+          </Pressable>
+        ) : null}
+
         <View style={styles.controls}>
           <Pressable
             style={({pressed}) => [styles.iconButton, pressed && styles.pressed]}
@@ -1563,6 +1716,44 @@ function App() {
                   onPress={() => setLineSpacing(s => Math.min(2.2, Number((s + 0.1).toFixed(1))))}>
                   <Text style={styles.stepperText}>+</Text>
                 </Pressable>
+              </View>
+            </View>
+            <View style={[styles.optionBox, styles.optionBoxColumn]}>
+              <View style={styles.sleepHeaderRow}>
+                <Text style={styles.optionLabel}>Sleep timer</Text>
+                {sleepActive ? (
+                  <Text style={styles.sleepValue}>{sleepLabel}</Text>
+                ) : null}
+              </View>
+              <View style={styles.sleepChipRow}>
+                {SLEEP_OPTIONS.map(option => {
+                  const selected =
+                    option.minutes == null && option.endOfChapter
+                      ? sleepEndOfChapter
+                      : option.minutes == null
+                        ? !sleepActive
+                        : sleepMinutes === option.minutes;
+                  return (
+                    <Pressable
+                      key={option.label}
+                      style={({pressed}) => [
+                        styles.sleepChip,
+                        selected && styles.sleepChipActive,
+                        pressed && styles.pressed,
+                      ]}
+                      onPress={() =>
+                        armSleepTimer(option.minutes, Boolean(option.endOfChapter))
+                      }>
+                      <Text
+                        style={[
+                          styles.sleepChipText,
+                          selected && styles.sleepChipTextActive,
+                        ]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
             </View>
           </Pressable>
@@ -2203,6 +2394,59 @@ function makeStyles(colors: typeof lightColors) {
       fontWeight: '900',
       minWidth: 24,
       textAlign: 'center',
+    },
+    optionBoxColumn: {
+      flexBasis: '100%',
+    },
+    sleepHeaderRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 6,
+    },
+    sleepValue: {
+      color: colors.accent,
+      fontSize: 12,
+      fontWeight: '800',
+    },
+    sleepChipRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 6,
+    },
+    sleepChip: {
+      borderColor: colors.border,
+      borderWidth: 1,
+      borderRadius: 999,
+      paddingHorizontal: 12,
+      paddingVertical: 6,
+      backgroundColor: colors.surface,
+    },
+    sleepChipActive: {
+      backgroundColor: colors.accent,
+      borderColor: colors.accent,
+    },
+    sleepChipText: {
+      color: colors.text,
+      fontSize: 12,
+      fontWeight: '700',
+    },
+    sleepChipTextActive: {
+      color: colors.accentText,
+    },
+    sleepIndicator: {
+      alignSelf: 'center',
+      marginTop: 6,
+      marginBottom: 2,
+      paddingHorizontal: 12,
+      paddingVertical: 4,
+      borderRadius: 999,
+      backgroundColor: colors.surface2,
+    },
+    sleepIndicatorText: {
+      color: colors.accent,
+      fontSize: 12,
+      fontWeight: '800',
     },
     logButton: {
       width: 58,

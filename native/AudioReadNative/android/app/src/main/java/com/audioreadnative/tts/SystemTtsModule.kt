@@ -171,6 +171,34 @@ class SystemTtsModule(
   }
 
   @ReactMethod
+  fun updateNowPlaying(
+    title: String,
+    subtitle: String,
+    isPlaying: Boolean,
+    elapsedSeconds: Double,
+    totalSeconds: Double,
+    promise: Promise,
+  ) {
+    try {
+      ContextCompat.startForegroundService(
+        reactContext,
+        AudioReadPlaybackService.updateIntent(
+          reactContext,
+          title,
+          subtitle,
+          isPlaying,
+          (elapsedSeconds * 1000).toLong().coerceAtLeast(0L),
+          (totalSeconds * 1000).toLong().coerceAtLeast(0L),
+        ),
+      )
+      promise.resolve(null)
+    } catch (e: Throwable) {
+      LogStore.write(TAG, "updateNowPlaying failed: ${e.stackTraceToString()}")
+      promise.reject("PLAYBACK_UPDATE_FAILED", e.message, e)
+    }
+  }
+
+  @ReactMethod
   fun stopPlaybackSession(promise: Promise) {
     try {
       LogStore.write(TAG, "stopPlaybackSession requested")
