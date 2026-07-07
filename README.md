@@ -1,29 +1,36 @@
 # 🔊 Audio Read
 
-Upload a PDF and listen to it — like Speechify, but simple, free, and 100% local.
-Text-to-speech runs **entirely in your browser** using the [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX) model. No backend, no API keys, nothing leaves your machine.
+Listen to your PDFs and EPUBs on Android. Audio Read reads any book or document
+aloud **over the original page**, highlighting each word as it goes — free, with
+no account and nothing leaving your device.
+
+**[⬇ Download the latest APK](https://github.com/aryannpanwarr/audio-read/releases/latest)**
 
 ## Features
 
-- **6 American voices** — Heart, Bella, Sarah (female) · Fenrir, Michael, Puck (male)
-- **Word-level highlighting** that follows the speech (estimated timing, tracks within ~a word)
-- **Click any word** to jump playback to that sentence
-- **Speed control** 0.75×–2× with natural pitch (re-synthesized, not resampled)
-- **Listening time estimate** — total and remaining, refined as it reads
-- WebGPU acceleration with automatic WASM fallback (~90 MB one-time model download, cached by the browser)
+- **Reads the real document** — narrates your PDF or EPUB over the original layout, figures and all
+- **Word-level highlighting** that follows the voice; tap any word to jump the narration there
+- **On-device & private** — uses your phone's built-in text-to-speech; no upload, no API keys
+- **Full player** — speed control, sleep timer, and a lock-screen media notification with play / pause / skip and Bluetooth controls
+- **Library** — organize books in folders and pick up where you left off
+- **PDF and EPUB** with sentence-aware playback and smart handling of abbreviations, units and headings
 
-## Run locally
+## Repository layout
+
+- `native/AudioReadNative/` — the Android app (React Native + native TTS / document modules)
+- `src/` — the landing page (Vite + React) deployed to Vercel
+
+## Landing page (this site)
 
 ```bash
 npm install
 npm run dev
 ```
 
-Append `?device=wasm` to the URL to force the WASM path (for testing without WebGPU).
+`npm run build` produces the static site; it's deployed on Vercel.
 
-## Notes
+## Android app
 
-- PDF text extraction uses pdf.js; scanned (image-only) PDFs are rejected — OCR is not supported.
-- Word highlighting is estimated by distributing each sentence's real audio duration across its words; Kokoro doesn't emit word timestamps.
-
-Built with Vite + React + TypeScript · [kokoro-js](https://github.com/hexgrad/kokoro) · pdfjs-dist
+See [`native/AudioReadNative/README.md`](native/AudioReadNative/README.md) for build
+instructions. Signed APK releases are published on the
+[GitHub releases page](https://github.com/aryannpanwarr/audio-read/releases).
