@@ -30,9 +30,7 @@ build/
 local.properties
 *.iml
 *.hprof
-.kokoro-downloads/
 .toolchains/
-android/app/src/main/assets/kokoro-en-v0_19/
 android/app/src/main/jniLibs/**/*.so
 .cxx/
 *.keystore
