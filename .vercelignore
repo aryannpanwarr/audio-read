@@ -1,0 +1,5 @@
+# The Android app + its toolchains/SDKs are not part of the web build.
+native
+.agents
+.codex
+scripts

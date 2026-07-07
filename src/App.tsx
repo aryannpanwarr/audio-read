@@ -1,95 +1,88 @@
-import { useReader } from './hooks/useReader'
-import { UploadScreen } from './components/UploadScreen'
-import { ModelLoadingBar } from './components/ModelLoadingBar'
-import { ReaderView } from './components/ReaderView'
-import { Controls } from './components/Controls'
+const REPO = 'https://github.com/aryannpanwarr/audio-read'
+const LATEST_RELEASE = `${REPO}/releases/latest`
+const VERSION = 'v0.9.0'
+
+const features = [
+  {
+    title: 'Reads the real document',
+    body: 'Opens your PDF or EPUB and reads it aloud over the original page — layout, figures and all. Nothing is reflowed or stripped.',
+  },
+  {
+    title: 'Word-level highlighting',
+    body: 'A moving highlight follows the voice word by word. Tap any word to jump the narration straight to that sentence.',
+  },
+  {
+    title: 'On-device, private, free',
+    body: 'Uses your phone’s built-in text-to-speech. No account, no upload, no API keys. Your files never leave the device.',
+  },
+  {
+    title: 'Player you already know',
+    body: 'Speed control, a sleep timer, and a lock-screen media notification with play / pause / skip and Bluetooth controls.',
+  },
+  {
+    title: 'A real library',
+    body: 'Keep books in folders, pick up where you left off, and manage everything from a clean, quiet home screen.',
+  },
+  {
+    title: 'PDF and EPUB',
+    body: 'Sentence-aware playback tuned for both formats, with smart handling of abbreviations, units and headings.',
+  },
+]
 
 export default function App() {
-  const reader = useReader()
-  const hasDocument = reader.sentences.length > 0
-
-  if (!hasDocument) {
-    return (
-      <UploadScreen
-        busy={reader.phase === 'extracting'}
-        error={reader.error}
-        onFile={reader.loadDocument}
-      />
-    )
-  }
-
   return (
-    <div className="app">
-      <header className="topbar">
-        <span className="brand">🔊 Audio Read</span>
-        {reader.engine === 'device' ? (
-          <span className="device-badge">device voices</span>
-        ) : (
-          reader.device && <span className="device-badge">{reader.device}</span>
-        )}
-        <button className="reset-btn" onClick={reader.reset}>
-          Open another PDF
-        </button>
+    <div className="page">
+      <header className="nav">
+        <span className="wordmark">
+          <span aria-hidden>🔊</span> Audio Read
+        </span>
+        <a className="nav-link" href={REPO} target="_blank" rel="noreferrer">
+          GitHub
+        </a>
       </header>
 
-      {reader.engine === 'kokoro' && reader.modelStatus === 'loading' && (
-        <ModelLoadingBar loaded={reader.modelProgress.loaded} total={reader.modelProgress.total} />
-      )}
-      {reader.error && (
-        <p className="error banner">
-          {reader.error}
-          {reader.engine === 'kokoro' && reader.modelStatus === 'idle' && (
-            <>
-              {' '}
-              <button className="retry-btn" onClick={reader.retryModel}>
-                Retry
-              </button>{' '}
-              <button className="retry-btn" onClick={() => reader.setEngine('device')}>
-                Use device voices instead
-              </button>
-            </>
-          )}
-        </p>
-      )}
+      <main>
+        <section className="hero">
+          <p className="eyebrow">Android · Free · On-device</p>
+          <h1>
+            Listen to your PDFs
+            <br />
+            and EPUBs.
+          </h1>
+          <p className="lede">
+            Audio Read turns any book or document into audio — read aloud on the original page,
+            with the words highlighted as you go. Everything runs on your phone.
+          </p>
 
-      {reader.hint && (
-        <p className="hint banner">
-          {reader.hint}{' '}
-          <button className="retry-btn" onClick={() => reader.setEngine('device')}>
-            Switch to device voices
-          </button>{' '}
-          <button className="retry-btn" onClick={reader.dismissHint}>
-            Dismiss
-          </button>
-        </p>
-      )}
+          <div className="cta">
+            <a className="btn btn-primary" href={LATEST_RELEASE} target="_blank" rel="noreferrer">
+              Download the APK
+            </a>
+            <a className="btn btn-ghost" href={`${REPO}/releases`} target="_blank" rel="noreferrer">
+              All releases
+            </a>
+          </div>
+          <p className="fineprint">
+            Latest {VERSION} · Android APK · install from the release page
+          </p>
+        </section>
 
-      <ReaderView
-        sentences={reader.sentences}
-        highlight={reader.highlight}
-        current={reader.current}
-        isPlaying={reader.phase === 'playing'}
-        onWordClick={reader.jumpTo}
-      />
+        <section className="features">
+          {features.map((f) => (
+            <div className="feature" key={f.title}>
+              <h2>{f.title}</h2>
+              <p>{f.body}</p>
+            </div>
+          ))}
+        </section>
+      </main>
 
-      <Controls
-        phase={reader.phase}
-        engine={reader.engine}
-        modelStatus={reader.modelStatus}
-        voice={reader.voice}
-        deviceVoices={reader.deviceVoices}
-        deviceVoiceUri={reader.deviceVoiceUri}
-        speed={reader.speed}
-        perf={reader.perf}
-        times={reader.times}
-        onPlay={reader.play}
-        onPause={reader.pause}
-        onEngine={reader.setEngine}
-        onVoice={reader.setVoice}
-        onDeviceVoice={reader.setDeviceVoiceUri}
-        onSpeed={reader.setSpeed}
-        onPerf={reader.setPerf}
-      />
+      <footer className="footer">
+        <span>Audio Read</span>
+        <a href={REPO} target="_blank" rel="noreferrer">
+          Source on GitHub
+        </a>
+      </footer>
     </div>
   )
 }
