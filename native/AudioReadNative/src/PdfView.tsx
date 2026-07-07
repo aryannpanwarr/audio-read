@@ -28,7 +28,7 @@ type PdfRect = {x: number; y: number; w: number; h: number};
 type PdfWord = {x: number; y: number; w: number; h: number; start: number; end: number};
 type PdfBox = {page: number; rects: PdfRect[]; words: PdfWord[]};
 
-// Graceful, Speechify-like blue: a soft block behind the whole paragraph and a stronger
+// Graceful reading-highlight blue: a soft block behind the whole paragraph and a stronger
 // fill on the word being spoken. PDFs render on white, so these read well in both themes.
 const BLOCK_COLOR = 'rgba(74,144,255,0.16)';
 const WORD_COLOR = 'rgba(74,144,255,0.42)';

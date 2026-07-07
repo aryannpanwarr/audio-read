@@ -490,7 +490,7 @@ class DocumentModule(
   /**
    * Extracts every PDF sentence together with the page + normalized bounding box of its
    * glyphs, so the JS layer can paint a highlight rectangle over the active sentence on
-   * the rendered page (ReadEra / Speechify style) instead of marking the whole page.
+   * the rendered page (ReadEra style) instead of marking the whole page.
    * The sentence list is index-aligned with what TTS reads, so sentence i ↔ box i.
    */
   @ReactMethod

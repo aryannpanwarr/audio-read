@@ -130,7 +130,7 @@ type DocumentReaderModule = {
 };
 
 // A paragraph's per-line rectangles (the soft block) + per-word boxes with the char
-// span they cover in the spoken text (for exact Speechify-style word highlighting).
+// span they cover in the spoken text (for exact word-level highlighting).
 type PdfRect = {x: number; y: number; w: number; h: number};
 type PdfWord = {x: number; y: number; w: number; h: number; start: number; end: number};
 type PdfBox = {page: number; rects: PdfRect[]; words: PdfWord[]};

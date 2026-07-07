@@ -330,7 +330,7 @@ class SystemTtsModule(
     override fun onStart(utteranceId: String?) = Unit
 
     // Exact per-word callback (API 26+): start/end are char offsets into the spoken text,
-    // letting the UI highlight the precise word being read (Speechify-style word tracking).
+    // letting the UI highlight the precise word being read (word-level tracking).
     override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
       val state = utteranceId?.let { utterances[it] }
       if (state != null) {
