@@ -24,3 +24,9 @@ dist-ssr
 *.sw?
 .claude/
 .vercel
+
+# Android signing — never commit these
+*.jks
+*.keystore
+!native/AudioReadNative/android/app/debug.keystore
+keystore.properties

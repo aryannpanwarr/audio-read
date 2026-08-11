@@ -8,7 +8,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
 import android.speech.tts.TextToSpeech
@@ -219,8 +218,10 @@ class SystemTtsModule(
         promise.resolve(false)
         return
       }
-      val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-        data = Uri.parse("package:${reactContext.packageName}")
+      // ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS opens the same settings screen
+      // without needing the REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission, which
+      // Play restricts to a narrow set of use cases. Costs the user one extra tap.
+      val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       }
       reactContext.startActivity(intent)
